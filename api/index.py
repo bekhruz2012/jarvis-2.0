@@ -1,8 +1,11 @@
+import asyncio
 import json
 import os
-import urllib.request
 import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler
+
+from ai import ask_jarvis
 
 
 # ============================================================
@@ -19,7 +22,7 @@ TELEGRAM_API = (
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM API
 # ============================================================
 
 def telegram_request(method, data):
@@ -28,11 +31,16 @@ def telegram_request(method, data):
     """
 
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not configured")
+        raise RuntimeError(
+            "BOT_TOKEN is not configured"
+        )
 
     url = f"{TELEGRAM_API}/{method}"
 
-    payload = json.dumps(data).encode("utf-8")
+    payload = json.dumps(
+        data,
+        ensure_ascii=False,
+    ).encode("utf-8")
 
     request = urllib.request.Request(
         url,
@@ -44,12 +52,15 @@ def telegram_request(method, data):
     )
 
     try:
+
         with urllib.request.urlopen(
             request,
-            timeout=10,
+            timeout=15,
         ) as response:
 
-            body = response.read().decode("utf-8")
+            body = response.read().decode(
+                "utf-8"
+            )
 
             return json.loads(body)
 
@@ -83,10 +94,25 @@ def telegram_request(method, data):
         }
 
 
-def send_message(chat_id, text):
+def send_message(
+    chat_id,
+    text,
+):
     """
     Отправляет сообщение пользователю.
     """
+
+    if not text:
+        return {
+            "ok": False,
+            "error": "Empty message",
+        }
+
+    # Telegram message limit
+    text = str(text)
+
+    if len(text) > 4000:
+        text = text[:3990] + "\n…"
 
     return telegram_request(
         "sendMessage",
@@ -98,7 +124,51 @@ def send_message(chat_id, text):
 
 
 # ============================================================
-# TELEGRAM UPDATE
+# AI
+# ============================================================
+
+async def generate_ai_answer(
+    user_id,
+    text,
+):
+    """
+    Вызывает существующий JARVIS AI.
+    """
+
+    try:
+
+        answer = await ask_jarvis(
+            user_id=user_id,
+            text=text,
+        )
+
+        if not answer:
+            return (
+                "Извините, я не смог "
+                "сформировать ответ."
+            )
+
+        return str(answer)
+
+    except Exception as e:
+
+        print()
+        print(
+            "🔥 AI ERROR"
+        )
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+        return (
+            "Извините, сейчас произошла "
+            "ошибка AI. Попробуйте ещё раз."
+        )
+
+
+# ============================================================
+# UPDATE PROCESSOR
 # ============================================================
 
 def process_update(update):
@@ -106,30 +176,53 @@ def process_update(update):
     Обрабатывает Telegram update.
     """
 
-    message = update.get("message")
+    message = update.get(
+        "message"
+    )
 
     if not message:
+
         return {
             "status": "ignored",
             "reason": "no_message",
         }
 
-    chat = message.get("chat") or {}
+    chat = message.get(
+        "chat"
+    ) or {}
 
-    chat_id = chat.get("id")
+    user = message.get(
+        "from"
+    ) or {}
+
+    chat_id = chat.get(
+        "id"
+    )
+
+    user_id = user.get(
+        "id"
+    )
+
+    text = (
+        message.get(
+            "text"
+        )
+        or ""
+    ).strip()
 
     if chat_id is None:
+
         return {
             "status": "ignored",
             "reason": "no_chat_id",
         }
 
-    text = (
-        message.get("text")
-        or ""
-    ).strip()
+    if user_id is None:
+
+        user_id = chat_id
 
     if not text:
+
         return {
             "status": "ignored",
             "reason": "no_text",
@@ -145,22 +238,28 @@ def process_update(update):
     )
 
     print(
+        f"👤 User ID: {user_id}"
+    )
+
+    print(
         f"💬 Text: {text[:1000]}"
     )
 
     # --------------------------------------------------------
-    # /start
+    # START
     # --------------------------------------------------------
 
-    if text.startswith("/start"):
+    if text.startswith(
+        "/start"
+    ):
 
         reply = (
             "🤖 JARVIS 2.0 ONLINE\n\n"
-            "Привет! Я получил твоё сообщение.\n\n"
             "🟢 Telegram: ONLINE\n"
             "🟢 Vercel: ONLINE\n"
+            "🟢 AI: ONLINE\n"
             "🟢 Webhook: ONLINE\n\n"
-            "🧠 AI-модуль будет подключён следующим этапом."
+            "Готов к работе."
         )
 
         result = send_message(
@@ -175,24 +274,57 @@ def process_update(update):
         }
 
     # --------------------------------------------------------
-    # обычное сообщение
+    # AI
     # --------------------------------------------------------
 
-    reply = (
-        "🤖 JARVIS получил сообщение:\n\n"
-        f"«{text[:3500]}»\n\n"
-        "🧠 AI пока находится на этапе подключения."
+    print()
+    print(
+        "🧠 Calling JARVIS AI..."
     )
 
-    result = send_message(
+    try:
+
+        answer = asyncio.run(
+            generate_ai_answer(
+                user_id=user_id,
+                text=text,
+            )
+        )
+
+    except Exception as e:
+
+        print(
+            "🔥 asyncio error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        answer = (
+            "Извините, произошла "
+            "внутренняя ошибка."
+        )
+
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
+    telegram_result = send_message(
         chat_id,
-        reply,
+        answer,
+    )
+
+    print()
+    print(
+        "📤 JARVIS RESPONSE"
+    )
+
+    print(
+        answer[:2000]
     )
 
     return {
         "status": "ok",
-        "action": "reply",
-        "telegram": result,
+        "action": "ai_reply",
+        "telegram": telegram_result,
     }
 
 
@@ -200,7 +332,9 @@ def process_update(update):
 # HTTP HANDLER
 # ============================================================
 
-class handler(BaseHTTPRequestHandler):
+class handler(
+    BaseHTTPRequestHandler
+):
 
     # --------------------------------------------------------
     # JSON RESPONSE
@@ -233,7 +367,9 @@ class handler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-        self.wfile.write(body)
+        self.wfile.write(
+            body
+        )
 
     # --------------------------------------------------------
     # GET
@@ -246,7 +382,10 @@ class handler(BaseHTTPRequestHandler):
             {
                 "status": "online",
                 "service": "JARVIS 2.0",
-                "telegram": bool(BOT_TOKEN),
+                "telegram": bool(
+                    BOT_TOKEN
+                ),
+                "ai": True,
                 "webhook": "ready",
             },
         )
@@ -272,7 +411,9 @@ class handler(BaseHTTPRequestHandler):
                     400,
                     {
                         "status": "error",
-                        "error": "Empty request body",
+                        "error": (
+                            "Empty request body"
+                        ),
                     },
                 )
 
@@ -288,7 +429,9 @@ class handler(BaseHTTPRequestHandler):
 
             print()
             print("=" * 60)
-            print("📨 TELEGRAM WEBHOOK")
+            print(
+                "📨 JARVIS WEBHOOK"
+            )
             print("=" * 60)
 
             result = process_update(
