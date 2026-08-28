@@ -18,7 +18,6 @@ from telegram.ext import (
 from config import (
     BOT_TOKEN,
     OWNER_ID,
-    SECURITY_ENABLED,
     MONITOR_ENABLED,
 )
 
@@ -27,6 +26,11 @@ from ai import (
     set_normal_mode,
     set_agro_mode,
     get_agro_remaining,
+)
+
+from security import (
+    set_security_enabled,
+    is_security_enabled,
 )
 
 from autoreply import (
@@ -46,8 +50,9 @@ from autoreply import (
 # RUNTIME
 # ============================================================
 
-_security_enabled = bool(SECURITY_ENABLED)
-_monitoring_enabled = bool(MONITOR_ENABLED)
+_monitoring_enabled = bool(
+    MONITOR_ENABLED
+)
 
 _monitor_application = None
 
@@ -55,35 +60,17 @@ _editing_reply_id = None
 
 
 # ============================================================
-# SECURITY
-# ============================================================
-
-def set_security_enabled(enabled: bool):
-
-    global _security_enabled
-
-    _security_enabled = bool(enabled)
-
-    print(
-        f"🛡 Security: "
-        f"{'ON' if _security_enabled else 'OFF'}"
-    )
-
-
-def is_security_enabled() -> bool:
-
-    return _security_enabled
-
-
-# ============================================================
 # MONITORING
 # ============================================================
 
-def set_monitoring_enabled(enabled: bool):
-
+def set_monitoring_enabled(
+    enabled: bool,
+):
     global _monitoring_enabled
 
-    _monitoring_enabled = bool(enabled)
+    _monitoring_enabled = bool(
+        enabled
+    )
 
     print(
         f"📡 Monitoring: "
@@ -100,7 +87,9 @@ def is_monitoring_enabled() -> bool:
 # OWNER
 # ============================================================
 
-def is_owner(update: Update) -> bool:
+def is_owner(
+    update: Update,
+) -> bool:
 
     user = update.effective_user
 
@@ -110,7 +99,9 @@ def is_owner(update: Update) -> bool:
     return user.id == OWNER_ID
 
 
-async def owner_only(update: Update) -> bool:
+async def owner_only(
+    update: Update,
+) -> bool:
 
     if is_owner(update):
         return True
@@ -143,7 +134,9 @@ async def owner_only(update: Update) -> bool:
 # FORMAT TIME
 # ============================================================
 
-def format_time(seconds: int) -> str:
+def format_time(
+    seconds: int,
+) -> str:
 
     seconds = max(
         0,
@@ -151,6 +144,7 @@ def format_time(seconds: int) -> str:
     )
 
     minutes = seconds // 60
+
     seconds %= 60
 
     if minutes:
@@ -188,12 +182,16 @@ def mode_text() -> str:
 # AUTOREPLY MODE TEXT
 # ============================================================
 
-def autoreply_mode_text(mode: str) -> str:
+def autoreply_mode_text(
+    mode: str,
+) -> str:
 
     if mode == "auto":
+
         return "🤖 АВТО"
 
     if mode == "ask":
+
         return "❓ СПРОСИТЬ РАЗРЕШЕНИЕ"
 
     return "✋ ВЫКЛЮЧЕНО"
@@ -205,7 +203,9 @@ def autoreply_mode_text(mode: str) -> str:
 
 def autoreply_status_text() -> str:
 
-    settings = get_autoreply_settings_runtime()
+    settings = (
+        get_autoreply_settings_runtime()
+    )
 
     mode = settings.get(
         "mode",
@@ -295,7 +295,9 @@ def main_keyboard():
 
 def autoreply_keyboard():
 
-    settings = get_autoreply_settings_runtime()
+    settings = (
+        get_autoreply_settings_runtime()
+    )
 
     mode = settings.get(
         "mode",
@@ -390,7 +392,9 @@ def delay_keyboard():
 
         row = []
 
-        for delay in delays[i:i + 2]:
+        for delay in delays[
+            i:i + 2
+        ]:
 
             row.append(
                 InlineKeyboardButton(
@@ -410,7 +414,9 @@ def delay_keyboard():
         ]
     )
 
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        rows
+    )
 
 
 # ============================================================
@@ -419,7 +425,9 @@ def delay_keyboard():
 
 def status_text() -> str:
 
-    settings = get_autoreply_settings_runtime()
+    settings = (
+        get_autoreply_settings_runtime()
+    )
 
     mode = settings.get(
         "mode",
@@ -531,7 +539,10 @@ async def cmd_autoreply(
 
     if context.args:
 
-        value = context.args[0].lower()
+        value = (
+            context.args[0]
+            .lower()
+        )
 
         if value == "auto":
 
@@ -592,7 +603,10 @@ async def cmd_security(
 
     if context.args:
 
-        value = context.args[0].lower()
+        value = (
+            context.args[0]
+            .lower()
+        )
 
         if value in {
             "on",
@@ -600,7 +614,9 @@ async def cmd_security(
             "true",
         }:
 
-            set_security_enabled(True)
+            set_security_enabled(
+                True
+            )
 
         elif value in {
             "off",
@@ -608,7 +624,9 @@ async def cmd_security(
             "false",
         }:
 
-            set_security_enabled(False)
+            set_security_enabled(
+                False
+            )
 
     await update.message.reply_text(
         status_text(),
@@ -631,7 +649,10 @@ async def cmd_monitoring(
 
     if context.args:
 
-        value = context.args[0].lower()
+        value = (
+            context.args[0]
+            .lower()
+        )
 
         if value in {
             "on",
@@ -639,7 +660,9 @@ async def cmd_monitoring(
             "true",
         }:
 
-            set_monitoring_enabled(True)
+            set_monitoring_enabled(
+                True
+            )
 
         elif value in {
             "off",
@@ -647,7 +670,9 @@ async def cmd_monitoring(
             "false",
         }:
 
-            set_monitoring_enabled(False)
+            set_monitoring_enabled(
+                False
+            )
 
     await update.message.reply_text(
         status_text(),
@@ -694,19 +719,26 @@ async def cmd_agro(
     if context.args:
 
         try:
+
             minutes = int(
                 context.args[0]
             )
 
         except ValueError:
+
             minutes = 30
 
     minutes = max(
         1,
-        min(minutes, 30),
+        min(
+            minutes,
+            30,
+        ),
     )
 
-    set_agro_mode(minutes)
+    set_agro_mode(
+        minutes
+    )
 
     await update.message.reply_text(
         status_text(),
@@ -818,7 +850,9 @@ async def cmd_analytics(
 # PENDING REPLY KEYBOARD
 # ============================================================
 
-def pending_reply_keyboard(reply_id):
+def pending_reply_keyboard(
+    reply_id,
+):
 
     return InlineKeyboardMarkup(
         [
@@ -907,7 +941,9 @@ async def button_handler(
 
     if action == "ar_mode_auto":
 
-        settings = get_autoreply_settings_runtime()
+        settings = (
+            get_autoreply_settings_runtime()
+        )
 
         delay = settings.get(
             "delay_minutes",
@@ -935,7 +971,9 @@ async def button_handler(
 
     if action == "ar_mode_ask":
 
-        settings = get_autoreply_settings_runtime()
+        settings = (
+            get_autoreply_settings_runtime()
+        )
 
         delay = settings.get(
             "delay_minutes",
@@ -964,7 +1002,9 @@ async def button_handler(
 
     if action == "ar_mode_off":
 
-        settings = get_autoreply_settings_runtime()
+        settings = (
+            get_autoreply_settings_runtime()
+        )
 
         delay = settings.get(
             "delay_minutes",
@@ -994,7 +1034,9 @@ async def button_handler(
 
     if action == "ar_delay_menu":
 
-        settings = get_autoreply_settings_runtime()
+        settings = (
+            get_autoreply_settings_runtime()
+        )
 
         current = settings.get(
             "delay_minutes",
@@ -1015,7 +1057,9 @@ async def button_handler(
     # DELAY
     # ========================================================
 
-    if action.startswith("ar_delay_"):
+    if action.startswith(
+        "ar_delay_"
+    ):
 
         try:
 
@@ -1027,7 +1071,9 @@ async def button_handler(
 
             delay = 0
 
-        settings = get_autoreply_settings_runtime()
+        settings = (
+            get_autoreply_settings_runtime()
+        )
 
         mode = settings.get(
             "mode",
@@ -1122,7 +1168,9 @@ async def button_handler(
 
     if action == "agro":
 
-        set_agro_mode(30)
+        set_agro_mode(
+            30
+        )
 
         await query.edit_message_text(
             status_text(),
@@ -1136,7 +1184,9 @@ async def button_handler(
     # APPROVE
     # ========================================================
 
-    if action.startswith("reply_approve:"):
+    if action.startswith(
+        "reply_approve:"
+    ):
 
         try:
 
@@ -1174,7 +1224,9 @@ async def button_handler(
     # EDIT
     # ========================================================
 
-    if action.startswith("reply_edit:"):
+    if action.startswith(
+        "reply_edit:"
+    ):
 
         try:
 
@@ -1213,7 +1265,9 @@ async def button_handler(
     # DENY
     # ========================================================
 
-    if action.startswith("reply_deny:"):
+    if action.startswith(
+        "reply_deny:"
+    ):
 
         try:
 
@@ -1319,7 +1373,11 @@ async def button_handler(
         )
 
         reply_rate = (
-            (replies / scheduled) * 100
+            (
+                replies
+                / scheduled
+            )
+            * 100
             if scheduled
             else 0
         )
@@ -1438,11 +1496,33 @@ async def start_monitor_bot(
     print(
         "🤖 Auto Reply settings loaded:"
     )
+
     print(
-        f"Mode: {settings.get('mode', 'off')}"
+        f"Mode: "
+        f"{settings.get('mode', 'off')}"
     )
+
     print(
-        f"Delay: {settings.get('delay_minutes', 0)} min."
+        f"Delay: "
+        f"{settings.get('delay_minutes', 0)} min."
+    )
+
+    # ========================================================
+    # SECURITY STATE
+    # ========================================================
+
+    print(
+        f"🛡 Security: "
+        f"{'ON' if is_security_enabled() else 'OFF'}"
+    )
+
+    # ========================================================
+    # MONITORING STATE
+    # ========================================================
+
+    print(
+        f"📡 Monitoring: "
+        f"{'ON' if is_monitoring_enabled() else 'OFF'}"
     )
 
     # ========================================================
@@ -1538,7 +1618,8 @@ async def start_monitor_bot(
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             edit_text_handler,
         )
     )
@@ -1558,9 +1639,15 @@ async def start_monitor_bot(
     _monitor_application = application
 
     print()
-    print("=" * 60)
-    print("📡 MONITOR BOT ONLINE")
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
+    print(
+        "📡 MONITOR BOT ONLINE"
+    )
+    print(
+        "=" * 60
+    )
 
     return application
 

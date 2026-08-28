@@ -18,6 +18,8 @@ from database import increment_stat
 # STATE
 # ============================================================
 
+_security_enabled = bool(SECURITY_ENABLED)
+
 _user_messages = defaultdict(
     lambda: deque(maxlen=MAX_TRACKED_MESSAGES)
 )
@@ -27,6 +29,35 @@ _duplicate_cache = defaultdict(
 )
 
 _blocked_users = set()
+
+
+# ============================================================
+# SECURITY RUNTIME STATE
+# ============================================================
+
+def set_security_enabled(enabled: bool):
+    """
+    Включает или выключает Security в runtime.
+
+    Это состояние используется всеми частями JARVIS.
+    """
+
+    global _security_enabled
+
+    _security_enabled = bool(enabled)
+
+    print(
+        f"🛡 Security: "
+        f"{'ON' if _security_enabled else 'OFF'}"
+    )
+
+
+def is_security_enabled() -> bool:
+    """
+    Возвращает текущее runtime-состояние Security.
+    """
+
+    return _security_enabled
 
 
 # ============================================================
@@ -147,11 +178,15 @@ def normalize_text(text):
 
     try:
         text = str(text).lower().strip()
+
     except Exception:
         return ""
 
-    # Убираем повторяющиеся пробелы
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     return text
 
@@ -185,7 +220,9 @@ def contains_url(text):
         return False
 
     return bool(
-        _URL_PATTERN.search(str(text))
+        _URL_PATTERN.search(
+            str(text)
+        )
     )
 
 
@@ -198,7 +235,9 @@ def count_urls(text):
         return 0
 
     return len(
-        _URL_PATTERN.findall(str(text))
+        _URL_PATTERN.findall(
+            str(text)
+        )
     )
 
 
@@ -230,6 +269,7 @@ def calculate_scam_score(text):
     ]
 
     if matched_keywords:
+
         score += min(
             60,
             len(matched_keywords) * 25,
@@ -244,9 +284,12 @@ def calculate_scam_score(text):
     # URLs
     # --------------------------------------------------------
 
-    url_count = count_urls(normalized)
+    url_count = count_urls(
+        normalized
+    )
 
     if url_count:
+
         score += min(
             25,
             url_count * 10,
@@ -266,6 +309,7 @@ def calculate_scam_score(text):
     )
 
     if suspicious_found:
+
         score += 25
 
         reasons.append(
@@ -284,6 +328,7 @@ def calculate_scam_score(text):
     )
 
     if urgency_count:
+
         score += min(
             20,
             urgency_count * 10,
@@ -294,19 +339,27 @@ def calculate_scam_score(text):
             "и срочность"
         )
 
-    return min(100, score), reasons
+    return min(
+        100,
+        score,
+    ), reasons
 
 
 # ============================================================
 # SPAM SCORE
 # ============================================================
 
-def calculate_spam_score(user_id, text):
+def calculate_spam_score(
+    user_id,
+    text,
+):
     """
     Анализирует частоту и характер сообщений пользователя.
     """
 
-    normalized = normalize_text(text)
+    normalized = normalize_text(
+        text
+    )
 
     if not user_id:
         return 0, []
@@ -315,7 +368,9 @@ def calculate_spam_score(user_id, text):
     reasons = []
     now = time.time()
 
-    history = _user_messages[user_id]
+    history = _user_messages[
+        user_id
+    ]
 
     # --------------------------------------------------------
     # Add current message
@@ -350,7 +405,9 @@ def calculate_spam_score(user_id, text):
     # Message flood
     # --------------------------------------------------------
 
-    message_count = len(recent)
+    message_count = len(
+        recent
+    )
 
     if message_count >= 5:
 
@@ -368,7 +425,9 @@ def calculate_spam_score(user_id, text):
     # Very short messages
     # --------------------------------------------------------
 
-    if 0 < len(normalized) <= 3:
+    if (
+        0 < len(normalized) <= 3
+    ):
 
         score += 5
 
@@ -423,7 +482,9 @@ def calculate_spam_score(user_id, text):
     # Multiple links
     # --------------------------------------------------------
 
-    url_count = count_urls(normalized)
+    url_count = count_urls(
+        normalized
+    )
 
     if url_count >= 2:
 
@@ -465,27 +526,37 @@ def calculate_spam_score(user_id, text):
             "знаков пунктуации"
         )
 
-    return min(100, score), reasons
+    return min(
+        100,
+        score,
+    ), reasons
 
 
 # ============================================================
 # DUPLICATE DETECTION
 # ============================================================
 
-def is_duplicate(user_id, text):
+def is_duplicate(
+    user_id,
+    text,
+):
     """
     Проверяет, отправлял ли пользователь
     такое же сообщение недавно.
     """
 
-    normalized = normalize_text(text)
+    normalized = normalize_text(
+        text
+    )
 
     if not normalized or not user_id:
         return False
 
     now = time.time()
 
-    cache = _duplicate_cache[user_id]
+    cache = _duplicate_cache[
+        user_id
+    ]
 
     # --------------------------------------------------------
     # Cleanup
@@ -510,6 +581,7 @@ def is_duplicate(user_id, text):
     for item in cache:
 
         if item["text"] == normalized:
+
             return True
 
     # --------------------------------------------------------
@@ -540,17 +612,27 @@ def decide_action(
 
     # Scam имеет приоритет.
     if scam_score >= SCAM_THRESHOLD:
+
         return "block"
 
     # Spam.
     if spam_score >= SPAM_THRESHOLD:
+
         return "block"
 
     # Warning при 70% от порога.
-    if scam_score >= SCAM_THRESHOLD * 0.70:
+    if (
+        scam_score
+        >= SCAM_THRESHOLD * 0.70
+    ):
+
         return "warn"
 
-    if spam_score >= SPAM_THRESHOLD * 0.70:
+    if (
+        spam_score
+        >= SPAM_THRESHOLD * 0.70
+    ):
+
         return "warn"
 
     return "allow"
@@ -584,7 +666,7 @@ async def analyze_message(
     # SECURITY DISABLED
     # ========================================================
 
-    if not SECURITY_ENABLED:
+    if not is_security_enabled():
 
         return {
             "action": "allow",
@@ -619,10 +701,7 @@ async def analyze_message(
     # ========================================================
     # STATISTICS
     #
-    # ВАЖНО:
     # security_checks увеличивается здесь ОДИН раз.
-    # telethon_client.py больше не должен увеличивать
-    # этот counter после analyze_message().
     # ========================================================
 
     try:
@@ -706,7 +785,6 @@ async def analyze_message(
         scam_reasons
     )
 
-    # Убираем дубликаты, сохраняя порядок.
     reasons = list(
         dict.fromkeys(
             reasons
@@ -865,29 +943,37 @@ async def analyze_message(
 # BLOCK MEMORY
 # ============================================================
 
-def remember_blocked_user(user_id):
+def remember_blocked_user(
+    user_id,
+):
     """
     Добавляет пользователя во внутренний Security block list.
     """
 
     if user_id:
+
         _blocked_users.add(
             user_id
         )
 
 
-def forget_blocked_user(user_id):
+def forget_blocked_user(
+    user_id,
+):
     """
     Удаляет пользователя из внутреннего block list.
     """
 
     if user_id:
+
         _blocked_users.discard(
             user_id
         )
 
 
-def is_user_blocked(user_id):
+def is_user_blocked(
+    user_id,
+):
     """
     Проверяет внутренний Security block list.
     """
@@ -905,7 +991,7 @@ def get_security_status():
     """
 
     return {
-        "enabled": SECURITY_ENABLED,
+        "enabled": is_security_enabled(),
 
         "tracked_users": len(
             _user_messages
@@ -938,7 +1024,9 @@ def get_security_status():
 # CLEAR USER HISTORY
 # ============================================================
 
-def clear_user_history(user_id):
+def clear_user_history(
+    user_id,
+):
     """
     Очищает историю Security конкретного пользователя.
     """
@@ -958,7 +1046,9 @@ def clear_user_history(user_id):
 # CLEAR BLOCK
 # ============================================================
 
-def clear_block(user_id):
+def clear_block(
+    user_id,
+):
     """
     Снимает внутренний Security block
     и очищает историю пользователя.
