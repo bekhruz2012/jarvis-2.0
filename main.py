@@ -5,17 +5,35 @@ from contextlib import suppress
 
 from aiohttp import web
 
-from telethon_client import start_telegram, stop_telegram
+from telethon_client import (
+    start_telegram,
+    stop_telegram,
+)
+
+from monitor_bot import (
+    start_monitor_bot,
+    stop_monitor_bot,
+)
+
+from telethon_client import (
+    set_monitor_bot,
+)
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000",
+    )
+)
 
 HOST = "0.0.0.0"
 
-KEEP_ALIVE_INTERVAL = 180  # 3 минуты
+KEEP_ALIVE_INTERVAL = 180
 
 APP_NAME = "JARVIS 2.0"
 
@@ -31,17 +49,16 @@ WEB_RUNNER = None
 WEB_SITE = None
 
 KEEP_ALIVE_TASK = None
+
 TELEGRAM_STARTED = False
+MONITOR_STARTED = False
 
 
 # ============================================================
-# LOGGING
+# LOG
 # ============================================================
 
 def log(message):
-    """
-    Единый формат логов.
-    """
 
     print(
         f"[JARVIS] {message}",
@@ -50,13 +67,10 @@ def log(message):
 
 
 # ============================================================
-# HTTP ROUTES
+# HTTP
 # ============================================================
 
 async def index(request):
-    """
-    Главная страница.
-    """
 
     uptime = int(
         time.time() - START_TIME
@@ -67,6 +81,7 @@ async def index(request):
             "status": "online",
             "service": APP_NAME,
             "telegram": TELEGRAM_STARTED,
+            "monitor_bot": MONITOR_STARTED,
             "uptime_seconds": uptime,
             "timestamp": int(time.time()),
         }
@@ -74,9 +89,6 @@ async def index(request):
 
 
 async def health(request):
-    """
-    Health check для Render.
-    """
 
     uptime = int(
         time.time() - START_TIME
@@ -84,18 +96,20 @@ async def health(request):
 
     return web.json_response(
         {
-            "status": "healthy",
+            "status": (
+                "healthy"
+                if TELEGRAM_STARTED
+                else "degraded"
+            ),
             "service": APP_NAME,
             "telegram": TELEGRAM_STARTED,
+            "monitor_bot": MONITOR_STARTED,
             "uptime_seconds": uptime,
         }
     )
 
 
 async def ping(request):
-    """
-    Простой ping endpoint.
-    """
 
     return web.Response(
         text="JARVIS 2.0 ONLINE",
@@ -108,12 +122,6 @@ async def ping(request):
 # ============================================================
 
 async def start_web_server():
-    """
-    Запускает HTTP сервер.
-
-    Render требует, чтобы Web Service
-    слушал порт из переменной PORT.
-    """
 
     global WEB_APP
     global WEB_RUNNER
@@ -155,22 +163,15 @@ async def start_web_server():
 
     log(
         f"🌐 HTTP server: ONLINE "
-        f"http://{HOST}:{PORT}"
+        f"{HOST}:{PORT}"
     )
 
-    log(
-        f"❤️ Health: /health"
-    )
-
-    log(
-        f"🏠 Home: /"
-    )
+    log("❤️ Health: /health")
+    log("🏠 Home: /")
+    log("📡 HTTP server uses PORT only")
 
 
 async def stop_web_server():
-    """
-    Останавливает HTTP сервер.
-    """
 
     global WEB_APP
     global WEB_RUNNER
@@ -202,16 +203,6 @@ async def stop_web_server():
 # ============================================================
 
 async def keep_alive_loop():
-    """
-    Внутренний heartbeat.
-
-    Каждые 3 минуты выводит heartbeat в Render Logs.
-
-    ВАЖНО:
-    Этот цикл поддерживает активность самого процесса.
-    Для Render Web Service также обязательно наличие
-    HTTP-сервера на PORT.
-    """
 
     log(
         "💓 Keep-alive loop запущен "
@@ -233,7 +224,8 @@ async def keep_alive_loop():
             log(
                 f"💓 JARVIS heartbeat | "
                 f"uptime={uptime}s | "
-                f"telegram={TELEGRAM_STARTED}"
+                f"telegram={TELEGRAM_STARTED} | "
+                f"monitor={MONITOR_STARTED}"
             )
 
         except asyncio.CancelledError:
@@ -257,12 +249,10 @@ async def keep_alive_loop():
 # ============================================================
 
 async def startup():
-    """
-    Полный запуск JARVIS.
-    """
 
     global KEEP_ALIVE_TASK
     global TELEGRAM_STARTED
+    global MONITOR_STARTED
 
     print()
     print("=" * 70)
@@ -272,25 +262,27 @@ async def startup():
 
     log("🚀 Запуск JARVIS...")
 
-    # --------------------------------------------------------
-    # ENV CHECK
-    # --------------------------------------------------------
+    # ========================================================
+    # ENV
+    # ========================================================
 
-    log("🔧 Проверяем Environment Variables...")
+    log(
+        "🔧 Проверяем Environment Variables..."
+    )
 
     required_variables = [
         "TG_API_ID",
         "TG_API_HASH",
         "TG_SESSION",
+        "BOT_TOKEN",
+        "OWNER_ID",
     ]
 
     missing = []
 
     for variable in required_variables:
 
-        value = os.getenv(variable)
-
-        if not value:
+        if not os.getenv(variable):
 
             missing.append(variable)
 
@@ -301,38 +293,32 @@ async def startup():
             + ", ".join(missing)
         )
 
-        log(
-            "⚠️ Telegram может не запуститься."
-        )
-
     else:
 
         log(
             "✅ Telegram ENV variables: OK"
         )
 
-    # --------------------------------------------------------
-    # WEB SERVER FIRST
-    # --------------------------------------------------------
+    # ========================================================
+    # HTTP FIRST
+    # ========================================================
 
-    # Очень важно для Render:
-    # сначала поднимаем HTTP server.
     await start_web_server()
 
-    # --------------------------------------------------------
+    # ========================================================
     # KEEP ALIVE
-    # --------------------------------------------------------
+    # ========================================================
 
     KEEP_ALIVE_TASK = asyncio.create_task(
         keep_alive_loop()
     )
 
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
+    # ========================================================
+    # TELETHON USER CLIENT
+    # ========================================================
 
     log(
-        "📱 Запускаем Telegram Client..."
+        "📱 Запускаем Telegram User Client..."
     )
 
     try:
@@ -342,7 +328,7 @@ async def startup():
         TELEGRAM_STARTED = True
 
         log(
-            "✅ Telegram Client: ONLINE"
+            "✅ Telegram User Client: ONLINE"
         )
 
     except Exception as e:
@@ -354,23 +340,59 @@ async def startup():
             f"{type(e).__name__}: {e}"
         )
 
-        # ----------------------------------------------------
-        # ВАЖНО
-        # ----------------------------------------------------
-        #
-        # Не завершаем HTTP server.
-        #
-        # Благодаря этому Render получает ответ,
-        # а ошибка Telegram видна в Logs.
-        #
-
         log(
-            "⚠️ HTTP server продолжает работать."
+            "⚠️ Monitor Bot не будет запущен, "
+            "пока User Client не работает."
         )
 
-    # --------------------------------------------------------
+        return
+
+    # ========================================================
+    # MONITOR BOT
+    # ========================================================
+
+    log(
+        "🤖 Запускаем Monitor Bot..."
+    )
+
+    try:
+
+        monitor_application = (
+            await start_monitor_bot()
+        )
+
+        if monitor_application is not None:
+
+            set_monitor_bot(
+                monitor_application
+            )
+
+            MONITOR_STARTED = True
+
+            log(
+                "✅ Monitor Bot: ONLINE"
+            )
+
+        else:
+
+            MONITOR_STARTED = False
+
+            log(
+                "❌ Monitor Bot не вернул Application."
+            )
+
+    except Exception as e:
+
+        MONITOR_STARTED = False
+
+        log(
+            "❌ Monitor Bot startup error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    # ========================================================
     # READY
-    # --------------------------------------------------------
+    # ========================================================
 
     print()
     print("=" * 70)
@@ -383,17 +405,25 @@ async def startup():
     )
 
     log(
-        "❤️ Health endpoint = /health"
-    )
-
-    log(
-        f"💓 Heartbeat = every "
-        f"{KEEP_ALIVE_INTERVAL} seconds"
-    )
-
-    log(
         f"📱 Telegram = "
         f"{'ONLINE' if TELEGRAM_STARTED else 'OFFLINE'}"
+    )
+
+    log(
+        f"🤖 Monitor Bot = "
+        f"{'ONLINE' if MONITOR_STARTED else 'OFFLINE'}"
+    )
+
+    log(
+        "🤖 AutoReply = ENABLED"
+    )
+
+    log(
+        "🛡 Security = ENABLED"
+    )
+
+    log(
+        "📡 Monitoring = ENABLED"
     )
 
     print()
@@ -404,21 +434,19 @@ async def startup():
 # ============================================================
 
 async def shutdown():
-    """
-    Корректно останавливает JARVIS.
-    """
 
     global KEEP_ALIVE_TASK
     global TELEGRAM_STARTED
+    global MONITOR_STARTED
 
     print()
     print("=" * 70)
     print("🛑 JARVIS SHUTDOWN")
     print("=" * 70)
 
-    # --------------------------------------------------------
+    # ========================================================
     # KEEP ALIVE
-    # --------------------------------------------------------
+    # ========================================================
 
     if KEEP_ALIVE_TASK is not None:
 
@@ -436,9 +464,32 @@ async def shutdown():
 
         KEEP_ALIVE_TASK = None
 
-    # --------------------------------------------------------
+    # ========================================================
+    # MONITOR BOT
+    # ========================================================
+
+    if MONITOR_STARTED:
+
+        log(
+            "🤖 Останавливаем Monitor Bot..."
+        )
+
+        try:
+
+            await stop_monitor_bot()
+
+        except Exception as e:
+
+            log(
+                "⚠️ Monitor Bot shutdown error: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        MONITOR_STARTED = False
+
+    # ========================================================
     # TELEGRAM
-    # --------------------------------------------------------
+    # ========================================================
 
     if TELEGRAM_STARTED:
 
@@ -459,9 +510,9 @@ async def shutdown():
 
         TELEGRAM_STARTED = False
 
-    # --------------------------------------------------------
-    # WEB
-    # --------------------------------------------------------
+    # ========================================================
+    # HTTP
+    # ========================================================
 
     await stop_web_server()
 
@@ -475,17 +526,10 @@ async def shutdown():
 # ============================================================
 
 async def main():
-    """
-    Главная функция.
-    """
 
     await startup()
 
     try:
-
-        # ----------------------------------------------------
-        # НЕ ДАЁМ ПРОЦЕССУ ЗАВЕРШИТЬСЯ
-        # ----------------------------------------------------
 
         while True:
 
@@ -528,18 +572,9 @@ if __name__ == "__main__":
     except Exception as e:
 
         print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "🔥 FATAL JARVIS ERROR"
-        )
-
+        print("=" * 70)
+        print("🔥 FATAL JARVIS ERROR")
         print(
             f"{type(e).__name__}: {e}"
         )
-
-        print(
-            "=" * 70
-        )
+        print("=" * 70)

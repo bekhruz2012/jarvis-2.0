@@ -2713,7 +2713,7 @@ async def start_telegram():
     # ========================================================
 
     await init_edit_history()
-    
+
     from autoreply import set_autoreply_settings_runtime
 
     await set_autoreply_settings_runtime(
@@ -2722,13 +2722,17 @@ async def start_telegram():
     )
 
     # ========================================================
+    # RENDER HEALTH SERVER
+    # ========================================================
+
+    await start_health_server()
+
+    # ========================================================
     # EVENT HANDLERS
     # ========================================================
 
     # Handler @client.on(events.NewMessage(...))
     # уже зарегистрирован выше в этом файле.
-    #
-    # Ничего дополнительно запускать здесь НЕ нужно.
 
     # ========================================================
     # LOG
@@ -2744,7 +2748,6 @@ async def start_telegram():
     )
 
     if MY_USERNAME:
-
         print(
             f"📛 Username: @{MY_USERNAME}"
         )
@@ -2754,6 +2757,8 @@ async def start_telegram():
     )
 
     print()
+    print("🌐 Render Health Server: ONLINE")
+    print(f"🌐 Port: {RENDER_PORT}")
     print("📡 Telegram event listener: ONLINE")
     print("📩 Incoming messages: ENABLED")
     print("📤 Outgoing messages: ENABLED")
