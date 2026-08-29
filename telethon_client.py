@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import sqlite3
 import time
 from collections import defaultdict, deque
@@ -17,6 +18,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.error import BadRequest, TimedOut, NetworkError
 
 from config import (
     TG_API_ID,
@@ -52,19 +54,26 @@ from autoreply import (
 
 
 # ============================================================
-# TELEGRAM SESSION
+# CONFIG
 # ============================================================
-
-# На Render используется TG_SESSION.
-# Локально можно оставить SESSION_NAME для первоначальной
-# авторизации и генерации StringSession.
-
-import os
 
 TG_SESSION = os.getenv("TG_SESSION", "").strip()
 
+# Render Web Service требует открытый порт.
+# Если Render использует PORT — берём его.
+RENDER_PORT = int(os.getenv("PORT", "10000"))
+
+SECURITY_NOTIFICATION_COOLDOWN = 60
+DELETED_BATCH_DELAY = 2
+
+
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
+
 if TG_SESSION:
-    print("🔐 Telegram: используем StringSession из ENV")
+
+    print("🔐 Telegram: используем TG_SESSION из ENV")
 
     client = TelegramClient(
         StringSession(TG_SESSION),
@@ -73,7 +82,8 @@ if TG_SESSION:
     )
 
 else:
-    print("🔐 Telegram: StringSession не найдена")
+
+    print("🔐 Telegram: TG_SESSION не найдена")
     print("📱 Используется локальная SESSION_NAME")
 
     client = TelegramClient(
@@ -81,6 +91,7 @@ else:
         TG_API_ID,
         TG_API_HASH,
     )
+
 
 # ============================================================
 # GLOBAL STATE
@@ -91,6 +102,8 @@ MY_USERNAME = None
 MY_NAME = None
 
 MONITOR_BOT = None
+
+_health_server = None
 
 
 # ============================================================
@@ -105,12 +118,10 @@ _message_cache_order = deque(
 
 
 # ============================================================
-# SECURITY NOTIFICATION CACHE
+# SECURITY CACHE
 # ============================================================
 
 _security_notification_cache = {}
-
-SECURITY_NOTIFICATION_COOLDOWN = 60
 
 
 # ============================================================
@@ -118,10 +129,7 @@ SECURITY_NOTIFICATION_COOLDOWN = 60
 # ============================================================
 
 _deleted_batches = defaultdict(list)
-
 _deleted_batch_tasks = {}
-
-DELETED_BATCH_DELAY = 2
 
 
 # ============================================================
@@ -138,7 +146,7 @@ _edit_history_ready = False
 def row_get(row, key, default=None):
     """
     Безопасно получает значение из sqlite Row,
-    dict или обычного объекта.
+    dict или объекта.
     """
 
     if row is None:
@@ -159,24 +167,20 @@ def row_get(row, key, default=None):
 
 
 def safe_int(value, default=None):
-    """
-    Безопасное преобразование в int.
-    """
 
     try:
+
         if value is None:
             return default
 
         return int(value)
 
     except (ValueError, TypeError):
+
         return default
 
 
 def safe_text(text, limit=3000):
-    """
-    Экранирует текст для Telegram HTML.
-    """
 
     if text is None:
         return ""
@@ -193,9 +197,6 @@ def safe_text(text, limit=3000):
 
 
 def raw_text(text, limit=10000):
-    """
-    Возвращает обычный текст без HTML escape.
-    """
 
     if text is None:
         return ""
@@ -216,9 +217,6 @@ def raw_text(text, limit=10000):
 # ============================================================
 
 def set_monitor_bot(bot):
-    """
-    Подключает Monitor Bot.
-    """
 
     global MONITOR_BOT
 
@@ -232,55 +230,33 @@ def set_monitor_bot(bot):
 # ============================================================
 
 def get_display_name(sender):
-    """
-    Возвращает красивое имя пользователя.
-    """
 
     if sender is None:
         return "Unknown"
 
-    first_name = getattr(
-        sender,
-        "first_name",
-        None,
-    )
-
-    last_name = getattr(
-        sender,
-        "last_name",
-        None,
-    )
-
-    username = getattr(
-        sender,
-        "username",
-        None,
-    )
-
-    title = getattr(
-        sender,
-        "title",
-        None,
-    )
+    first_name = getattr(sender, "first_name", None)
+    last_name = getattr(sender, "last_name", None)
+    username = getattr(sender, "username", None)
+    title = getattr(sender, "title", None)
 
     if title:
+
         name = str(title)
 
     elif first_name:
+
         name = str(first_name)
 
         if last_name:
             name += f" {last_name}"
 
     elif username:
+
         name = f"@{username}"
 
     else:
-        sender_id = getattr(
-            sender,
-            "id",
-            None,
-        )
+
+        sender_id = getattr(sender, "id", None)
 
         name = str(
             sender_id
@@ -293,17 +269,16 @@ def get_display_name(sender):
         and not name.startswith("@")
         and f"@{username}" not in name
     ):
+
         name += f" (@{username})"
 
     return name
 
 
 def get_user_info(sender):
-    """
-    Возвращает основные данные пользователя.
-    """
 
     if sender is None:
+
         return {
             "id": None,
             "first_name": None,
@@ -313,21 +288,9 @@ def get_user_info(sender):
 
     return {
         "id": getattr(sender, "id", None),
-        "first_name": getattr(
-            sender,
-            "first_name",
-            None,
-        ),
-        "last_name": getattr(
-            sender,
-            "last_name",
-            None,
-        ),
-        "username": getattr(
-            sender,
-            "username",
-            None,
-        ),
+        "first_name": getattr(sender, "first_name", None),
+        "last_name": getattr(sender, "last_name", None),
+        "username": getattr(sender, "username", None),
     }
 
 
@@ -336,39 +299,18 @@ def get_user_info(sender):
 # ============================================================
 
 def get_chat_name(chat):
-    """
-    Возвращает имя чата.
-    """
 
     if chat is None:
         return "Unknown chat"
 
-    title = getattr(
-        chat,
-        "title",
-        None,
-    )
+    title = getattr(chat, "title", None)
 
     if title:
         return str(title)
 
-    first_name = getattr(
-        chat,
-        "first_name",
-        None,
-    )
-
-    last_name = getattr(
-        chat,
-        "last_name",
-        None,
-    )
-
-    username = getattr(
-        chat,
-        "username",
-        None,
-    )
+    first_name = getattr(chat, "first_name", None)
+    last_name = getattr(chat, "last_name", None)
+    username = getattr(chat, "username", None)
 
     if first_name:
 
@@ -382,11 +324,7 @@ def get_chat_name(chat):
     if username:
         return f"@{username}"
 
-    chat_id = getattr(
-        chat,
-        "id",
-        None,
-    )
+    chat_id = getattr(chat, "id", None)
 
     return str(
         chat_id
@@ -396,53 +334,26 @@ def get_chat_name(chat):
 
 
 def get_chat_type(chat):
-    """
-    Определяет тип Telegram чата.
-    """
 
     if chat is None:
         return "unknown"
 
-    if getattr(
-        chat,
-        "broadcast",
-        False,
-    ):
+    if getattr(chat, "broadcast", False):
         return "channel"
 
-    if getattr(
-        chat,
-        "megagroup",
-        False,
-    ):
+    if getattr(chat, "megagroup", False):
         return "supergroup"
 
-    if getattr(
-        chat,
-        "gigagroup",
-        False,
-    ):
+    if getattr(chat, "gigagroup", False):
         return "supergroup"
 
-    if getattr(
-        chat,
-        "bot",
-        False,
-    ):
+    if getattr(chat, "bot", False):
         return "bot"
 
-    if getattr(
-        chat,
-        "user",
-        False,
-    ):
+    if getattr(chat, "user", False):
         return "private"
 
-    if getattr(
-        chat,
-        "title",
-        None,
-    ):
+    if getattr(chat, "title", None):
         return "group"
 
     return "unknown"
@@ -453,6 +364,7 @@ def get_chat_type(chat):
 # ============================================================
 
 def make_cache_key(chat_id, message_id):
+
     return (
         safe_int(chat_id, 0),
         safe_int(message_id, 0),
@@ -464,9 +376,6 @@ def cache_message(
     message_id,
     data,
 ):
-    """
-    Сохраняет сообщение в RAM cache.
-    """
 
     key = make_cache_key(
         chat_id,
@@ -475,15 +384,11 @@ def cache_message(
 
     if key not in _message_cache:
 
-        if (
-            len(_message_cache_order)
-            >= MAX_MESSAGE_CACHE
-        ):
+        if len(_message_cache_order) >= MAX_MESSAGE_CACHE:
 
             try:
-                oldest = (
-                    _message_cache_order.popleft()
-                )
+
+                oldest = _message_cache_order.popleft()
 
                 _message_cache.pop(
                     oldest,
@@ -493,9 +398,7 @@ def cache_message(
             except IndexError:
                 pass
 
-        _message_cache_order.append(
-            key
-        )
+        _message_cache_order.append(key)
 
     _message_cache[key] = data
 
@@ -504,6 +407,7 @@ def get_cached_message(
     chat_id,
     message_id,
 ):
+
     return _message_cache.get(
         make_cache_key(
             chat_id,
@@ -516,6 +420,7 @@ def remove_cached_message(
     chat_id,
     message_id,
 ):
+
     _message_cache.pop(
         make_cache_key(
             chat_id,
@@ -533,20 +438,17 @@ async def notify_owner(
     text,
     buttons=None,
 ):
-    """
-    Отправляет сообщение владельцу через Monitor Bot.
-    """
 
     if MONITOR_BOT is None:
-        print(
-            "⚠️ Monitor Bot ещё не подключён."
-        )
+
+        print("⚠️ Monitor Bot ещё не подключён.")
+
         return False
 
     if MY_ID is None:
-        print(
-            "⚠️ MY_ID ещё не определён."
-        )
+
+        print("⚠️ MY_ID ещё не определён.")
+
         return False
 
     try:
@@ -560,23 +462,28 @@ async def notify_owner(
 
         return True
 
+    except (TimedOut, NetworkError) as e:
+
+        print(
+            f"⚠️ Monitor Bot network error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return False
+
+    except BadRequest as e:
+
+        print(
+            f"⚠️ Monitor Bot BadRequest: {e}"
+        )
+
+        return False
+
     except FloodWaitError as e:
 
         print(
             "⚠️ Monitor Bot FloodWait: "
             f"{getattr(e, 'seconds', 5)} sec"
-        )
-
-        return False
-
-    except (
-        asyncio.TimeoutError,
-        ConnectionError,
-    ) as e:
-
-        print(
-            "⚠️ Monitor Bot connection error: "
-            f"{type(e).__name__}: {e}"
         )
 
         return False
@@ -596,15 +503,14 @@ async def send_owner_document(
     filename,
     caption=None,
 ):
-    """
-    Отправляет текстовый файл владельцу.
-    """
 
     if MONITOR_BOT is None:
+
         print(
             "⚠️ Cannot send document: "
             "Monitor Bot unavailable."
         )
+
         return False
 
     if MY_ID is None:
@@ -630,13 +536,10 @@ async def send_owner_document(
 
         return True
 
-    except (
-        asyncio.TimeoutError,
-        ConnectionError,
-    ) as e:
+    except (TimedOut, NetworkError) as e:
 
         print(
-            "⚠️ Document connection error: "
+            "⚠️ Document network error: "
             f"{type(e).__name__}: {e}"
         )
 
@@ -660,10 +563,6 @@ def should_send_security_notification(
     user_id,
     event_type,
 ):
-    """
-    Не позволяет спамить владельца одинаковыми
-    security notifications.
-    """
 
     now = time.time()
 
@@ -677,10 +576,7 @@ def should_send_security_notification(
         0,
     )
 
-    if (
-        now - last
-        < SECURITY_NOTIFICATION_COOLDOWN
-    ):
+    if now - last < SECURITY_NOTIFICATION_COOLDOWN:
         return False
 
     _security_notification_cache[key] = now
@@ -689,9 +585,6 @@ def should_send_security_notification(
 
 
 def history_keyboard(user_id):
-    """
-    Inline keyboard для Security notification.
-    """
 
     user_id = safe_int(user_id)
 
@@ -700,35 +593,24 @@ def history_keyboard(user_id):
             [
                 InlineKeyboardButton(
                     "📖 Показать чат",
-                    callback_data=(
-                        f"history:{user_id}"
-                    ),
+                    callback_data=f"history:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
                     "🚫 Заблокировать",
-                    callback_data=(
-                        f"block:{user_id}"
-                    ),
+                    callback_data=f"block:{user_id}",
                 )
             ],
         ]
     )
 
 
-# ============================================================
-# SECURITY BLOCK NOTIFICATION
-# ============================================================
-
 async def notify_security_block(
     sender,
     result,
     text,
 ):
-    """
-    Уведомление о блокировке.
-    """
 
     if sender is None:
         return
@@ -789,9 +671,6 @@ async def notify_security_warning(
     result,
     text,
 ):
-    """
-    Уведомление о подозрительном сообщении.
-    """
 
     if sender is None:
         return
@@ -837,13 +716,10 @@ async def notify_security_warning(
 
 
 # ============================================================
-# EDIT HISTORY DATABASE
+# EDIT HISTORY
 # ============================================================
 
 async def init_edit_history():
-    """
-    Создаёт таблицу истории редактирования.
-    """
 
     global _edit_history_ready
 
@@ -897,6 +773,7 @@ async def init_edit_history():
             connection.commit()
 
         finally:
+
             connection.close()
 
     try:
@@ -907,9 +784,7 @@ async def init_edit_history():
 
         _edit_history_ready = True
 
-        print(
-            "✏️ Edit history DB: ONLINE"
-        )
+        print("✏️ Edit history DB: ONLINE")
 
     except Exception as e:
 
@@ -927,9 +802,6 @@ async def save_edit_history(
     old_text,
     new_text,
 ):
-    """
-    Сохраняет старую и новую версию сообщения.
-    """
 
     await init_edit_history()
 
@@ -970,13 +842,12 @@ async def save_edit_history(
             connection.commit()
 
         finally:
+
             connection.close()
 
     try:
 
-        await asyncio.to_thread(
-            save
-        )
+        await asyncio.to_thread(save)
 
     except Exception as e:
 
@@ -987,7 +858,7 @@ async def save_edit_history(
 
 
 # ============================================================
-# SECURITY PROCESSOR
+# SECURITY
 # ============================================================
 
 async def process_security(
@@ -996,12 +867,6 @@ async def process_security(
     chat_id,
     text,
 ):
-    """
-    Полностью обрабатывает Security.
-
-    True  -> обработка завершена.
-    False -> можно продолжать AutoReply.
-    """
 
     if sender is None:
         return False
@@ -1009,11 +874,7 @@ async def process_security(
     if not sender_id:
         return False
 
-    if getattr(
-        sender,
-        "bot",
-        False,
-    ):
+    if getattr(sender, "bot", False):
         return False
 
     try:
@@ -1048,17 +909,9 @@ async def process_security(
         "allow",
     )
 
-    print(
-        f"🛡️ Spam: {spam_score}/100"
-    )
-
-    print(
-        f"🎣 Scam: {scam_score}/100"
-    )
-
-    print(
-        f"⚙️ Security action: {action}"
-    )
+    print(f"🛡️ Spam: {spam_score}/100")
+    print(f"🎣 Scam: {scam_score}/100")
+    print(f"⚙️ Security action: {action}")
 
     # --------------------------------------------------------
     # BLOCK
@@ -1158,17 +1011,10 @@ async def process_security(
     )
 )
 async def new_message(event):
-    """
-    Главный обработчик входящих сообщений.
-    """
 
     global MY_ID
 
     try:
-
-        # ----------------------------------------------------
-        # OWNER ID
-        # ----------------------------------------------------
 
         if MY_ID is None:
 
@@ -1186,8 +1032,6 @@ async def new_message(event):
         # SENDER
         # ----------------------------------------------------
 
-        sender = None
-
         try:
 
             sender = await event.get_sender()
@@ -1198,6 +1042,8 @@ async def new_message(event):
                 "⚠️ Sender resolve error: "
                 f"{type(e).__name__}: {e}"
             )
+
+            sender = None
 
         sender_id = safe_int(
             event.sender_id
@@ -1219,8 +1065,6 @@ async def new_message(event):
         # CHAT
         # ----------------------------------------------------
 
-        chat = None
-
         try:
 
             chat = await event.get_chat()
@@ -1232,21 +1076,14 @@ async def new_message(event):
                 f"{type(e).__name__}: {e}"
             )
 
+            chat = None
+
         chat_id = safe_int(
             event.chat_id
         )
 
-        chat_name = get_chat_name(
-            chat
-        )
-
-        chat_type = get_chat_type(
-            chat
-        )
-
-        # ----------------------------------------------------
-        # LOG
-        # ----------------------------------------------------
+        chat_name = get_chat_name(chat)
+        chat_type = get_chat_type(chat)
 
         print()
         print("=" * 70)
@@ -1264,9 +1101,7 @@ async def new_message(event):
 
         if sender is not None and sender_id:
 
-            info = get_user_info(
-                sender
-            )
+            info = get_user_info(sender)
 
             try:
 
@@ -1386,20 +1221,13 @@ async def new_message(event):
                     f"{type(e).__name__}: {e}"
                 )
 
-        print(
-            "✅ Message processing complete."
-        )
+        print("✅ Message processing complete.")
 
     except Exception as e:
 
         print()
-        print(
-            "🔥 NEW MESSAGE HANDLER ERROR"
-        )
-
-        print(
-            f"{type(e).__name__}: {e}"
-        )
+        print("🔥 NEW MESSAGE HANDLER ERROR")
+        print(f"{type(e).__name__}: {e}")
 
 
 # ============================================================
@@ -1412,9 +1240,6 @@ async def new_message(event):
     )
 )
 async def owner_message(event):
-    """
-    Отслеживает сообщения владельца.
-    """
 
     global MY_ID
 
@@ -1450,10 +1275,8 @@ async def owner_message(event):
                 f"{type(e).__name__}: {e}"
             )
 
-        print()
         print(
-            f"📤 OWNER MESSAGE -> "
-            f"{event.chat_id}"
+            f"📤 OWNER MESSAGE -> {event.chat_id}"
         )
 
     except Exception as e:
@@ -1474,64 +1297,33 @@ async def owner_message(event):
     )
 )
 async def edited_message(event):
-    """
-    Обрабатывает изменение сообщения.
-    """
 
     try:
 
-        chat_id = safe_int(
-            event.chat_id
-        )
-
-        message_id = safe_int(
-            event.id
-        )
-
-        sender = None
+        chat_id = safe_int(event.chat_id)
+        message_id = safe_int(event.id)
+        sender_id = safe_int(event.sender_id)
 
         try:
-
             sender = await event.get_sender()
-
-        except Exception as e:
-
-            print(
-                "⚠️ Edit sender error: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        chat = None
+        except Exception:
+            sender = None
 
         try:
-
             chat = await event.get_chat()
-
         except Exception:
-            pass
+            chat = None
 
-        chat_name = get_chat_name(
-            chat
-        )
-
-        chat_type = get_chat_type(
-            chat
-        )
-
-        sender_id = safe_int(
-            event.sender_id
-        )
-
-        sender_name = get_display_name(
-            sender
-        )
+        chat_name = get_chat_name(chat)
+        chat_type = get_chat_type(chat)
+        sender_name = get_display_name(sender)
 
         new_text = (
             event.raw_text or ""
         ).strip()
 
         # ----------------------------------------------------
-        # FIND OLD MESSAGE
+        # OLD MESSAGE
         # ----------------------------------------------------
 
         old = None
@@ -1567,12 +1359,13 @@ async def edited_message(event):
             )
 
             if cached:
+
                 old_text = cached.get(
                     "text"
                 )
 
         # ----------------------------------------------------
-        # NOTHING CHANGED
+        # SAME MESSAGE
         # ----------------------------------------------------
 
         if (
@@ -1590,16 +1383,12 @@ async def edited_message(event):
             chat_id=chat_id,
             sender_id=sender_id,
             sender_name=sender_name,
-            old_text=(
-                old_text
-                if old_text is not None
-                else ""
-            ),
+            old_text=old_text or "",
             new_text=new_text,
         )
 
         # ----------------------------------------------------
-        # UPDATE MAIN MESSAGE
+        # UPDATE DB
         # ----------------------------------------------------
 
         try:
@@ -1626,6 +1415,7 @@ async def edited_message(event):
         )
 
         if cached:
+
             cached["text"] = new_text
 
         # ----------------------------------------------------
@@ -1666,7 +1456,6 @@ async def edited_message(event):
             ),
         )
 
-        print()
         print("✏️ MESSAGE EDITED")
         print(f"💬 Chat: {chat_name}")
         print(f"🆔 Message: {message_id}")
@@ -1675,23 +1464,17 @@ async def edited_message(event):
 
         print()
         print("🔥 EDIT HANDLER ERROR")
-        print(
-            f"{type(e).__name__}: {e}"
-        )
+        print(f"{type(e).__name__}: {e}")
 
 
 # ============================================================
-# PROCESS DELETED MESSAGE
+# DELETED MESSAGE
 # ============================================================
 
 async def process_deleted_message(
     message_id,
     chat_id=None,
 ):
-    """
-    Находит удалённое сообщение в DB/cache
-    и помечает его deleted.
-    """
 
     try:
 
@@ -1727,10 +1510,6 @@ async def process_deleted_message(
             )
 
             return None
-
-        # ----------------------------------------------------
-        # EXTRACT DATA
-        # ----------------------------------------------------
 
         if old is not None:
 
@@ -1807,10 +1586,6 @@ async def process_deleted_message(
                 else "Unknown"
             )
 
-        # ----------------------------------------------------
-        # MARK DELETED
-        # ----------------------------------------------------
-
         try:
 
             await mark_message_deleted(
@@ -1850,16 +1625,10 @@ async def process_deleted_message(
 
 
 # ============================================================
-# DELETED BATCH FLUSH
+# DELETE BATCH
 # ============================================================
 
 async def flush_deleted_batch(chat_id):
-    """
-    Группирует удалённые сообщения.
-
-    <5 сообщений -> отдельные notifications.
-    >=5 -> один TXT файл.
-    """
 
     try:
 
@@ -1882,19 +1651,13 @@ async def flush_deleted_batch(chat_id):
 
         messages.sort(
             key=lambda item: (
-                item.get(
-                    "created_at",
-                    "",
-                ),
-                item.get(
-                    "message_id",
-                    0,
-                ),
+                item.get("created_at", ""),
+                item.get("message_id", 0),
             )
         )
 
         # ----------------------------------------------------
-        # SMALL DELETE
+        # LESS THAN 5
         # ----------------------------------------------------
 
         if len(messages) < 5:
@@ -1933,7 +1696,7 @@ async def flush_deleted_batch(chat_id):
             return
 
         # ----------------------------------------------------
-        # LARGE DELETE -> FILE
+        # 5+ -> TXT
         # ----------------------------------------------------
 
         lines = [
@@ -1976,18 +1739,12 @@ async def flush_deleted_batch(chat_id):
                 ]
             )
 
-        content = "\n".join(
-            lines
-        )
-
-        timestamp = int(
-            time.time()
-        )
+        content = "\n".join(lines)
 
         filename = (
             f"jarvis_deleted_"
             f"{chat_id}_"
-            f"{timestamp}.txt"
+            f"{int(time.time())}.txt"
         )
 
         caption = (
@@ -2020,24 +1777,15 @@ async def flush_deleted_batch(chat_id):
         )
 
 
-# ============================================================
-# DELETED MESSAGE EVENT
-# ============================================================
-
 @client.on(
     events.MessageDeleted()
 )
 async def deleted_message(event):
-    """
-    Обработчик удаления сообщений.
-    """
 
     try:
 
         print()
-        print(
-            "🗑️ MESSAGE DELETED EVENT"
-        )
+        print("🗑️ MESSAGE DELETED EVENT")
 
         event_chat_id = safe_int(
             getattr(
@@ -2076,14 +1824,10 @@ async def deleted_message(event):
 
             _deleted_batches[
                 actual_chat_id
-            ].append(
-                deleted
-            )
+            ].append(deleted)
 
-            existing_task = (
-                _deleted_batch_tasks.get(
-                    actual_chat_id
-                )
+            existing_task = _deleted_batch_tasks.get(
+                actual_chat_id
             )
 
             if (
@@ -2104,13 +1848,8 @@ async def deleted_message(event):
     except Exception as e:
 
         print()
-        print(
-            "🔥 DELETE HANDLER ERROR"
-        )
-
-        print(
-            f"{type(e).__name__}: {e}"
-        )
+        print("🔥 DELETE HANDLER ERROR")
+        print(f"{type(e).__name__}: {e}")
 
 
 # ============================================================
@@ -2121,15 +1860,10 @@ def format_chat_history(
     messages,
     title="История чата",
 ):
-    """
-    Форматирует историю для Telegram HTML.
-    """
 
     if not messages:
 
-        return (
-            "📭 <b>История пуста.</b>"
-        )
+        return "📭 <b>История пуста.</b>"
 
     result = (
         f"📖 <b>{safe_text(title, 200)}</b>\n\n"
@@ -2170,22 +1904,15 @@ def format_chat_history(
         flags = []
 
         if deleted:
-            flags.append(
-                "🗑️ deleted"
-            )
+            flags.append("🗑️ deleted")
 
         if edited:
-            flags.append(
-                "✏️ edited"
-            )
+            flags.append("✏️ edited")
 
         flag_text = ""
 
         if flags:
-            flag_text = (
-                " "
-                + " ".join(flags)
-            )
+            flag_text = " " + " ".join(flags)
 
         result += (
             f"👤 <b>{safe_text(sender_name, 150)}</b>"
@@ -2206,9 +1933,7 @@ def format_chat_history(
 
         if len(result) >= 3800:
 
-            result += (
-                "\n… История сокращена."
-            )
+            result += "\n… История сокращена."
 
             break
 
@@ -2219,9 +1944,6 @@ async def show_chat_history(
     user_id,
     limit=30,
 ):
-    """
-    Возвращает историю чата.
-    """
 
     try:
 
@@ -2249,25 +1971,17 @@ async def show_chat_history(
 
 
 # ============================================================
-# TELEGRAM BLOCK
+# BLOCK / UNBLOCK
 # ============================================================
 
 async def block_telegram_user(user_id):
-    """
-    Блокирует пользователя через Telegram account.
-    """
 
-    user_id = safe_int(
-        user_id
-    )
+    user_id = safe_int(user_id)
 
     if not user_id:
         return False
 
-    if (
-        MY_ID is not None
-        and user_id == MY_ID
-    ):
+    if MY_ID is not None and user_id == MY_ID:
 
         print(
             "🛑 Refusing to block owner."
@@ -2318,13 +2032,8 @@ async def block_telegram_user(user_id):
 
 
 async def unblock_telegram_user(user_id):
-    """
-    Разблокирует пользователя через Telegram.
-    """
 
-    user_id = safe_int(
-        user_id
-    )
+    user_id = safe_int(user_id)
 
     if not user_id:
         return False
@@ -2371,17 +2080,10 @@ async def unblock_telegram_user(user_id):
         return False
 
 
-# ============================================================
-# MANUAL BLOCK
-# ============================================================
-
 async def manual_block_user(
     user_id,
     reason="Заблокировано владельцем",
 ):
-    """
-    Ручная блокировка.
-    """
 
     success = await block_telegram_user(
         user_id
@@ -2407,14 +2109,7 @@ async def manual_block_user(
     return True
 
 
-# ============================================================
-# MANUAL UNBLOCK
-# ============================================================
-
 async def manual_unblock_user(user_id):
-    """
-    Ручная разблокировка.
-    """
 
     success = await unblock_telegram_user(
         user_id
@@ -2440,41 +2135,7 @@ async def manual_unblock_user(user_id):
 
 
 # ============================================================
-# PRIVATE USER
-# ============================================================
-
-async def get_private_user(user_id):
-    """
-    Получает Telegram entity пользователя.
-    """
-
-    try:
-
-        entity = await client.get_entity(
-            user_id
-        )
-
-    except Exception as e:
-
-        print(
-            "❌ Entity error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        return None
-
-    if getattr(
-        entity,
-        "bot",
-        False,
-    ):
-        return None
-
-    return entity
-
-
-# ============================================================
-# CALLBACK BUTTONS
+# CALLBACK HELPERS
 # ============================================================
 
 async def answer_callback(
@@ -2482,15 +2143,12 @@ async def answer_callback(
     text,
     alert=False,
 ):
-    """
-    Безопасно отвечает на callback query.
-    """
 
     try:
 
         await query.answer(
             text,
-            alert=alert,
+            show_alert=alert,
         )
 
     except Exception as e:
@@ -2506,9 +2164,6 @@ async def edit_callback_message(
     text,
     buttons=None,
 ):
-    """
-    Безопасно редактирует сообщение Monitor Bot.
-    """
 
     try:
 
@@ -2520,6 +2175,38 @@ async def edit_callback_message(
 
         return True
 
+    except BadRequest as e:
+
+        error_text = str(e).lower()
+
+        # Это НЕ критическая ошибка.
+        # Telegram сообщает, что сообщение уже такое же.
+
+        if "message is not modified" in error_text:
+
+            print(
+                "ℹ️ Monitor callback: "
+                "message already has this content."
+            )
+
+            return True
+
+        print(
+            "⚠️ Callback BadRequest: "
+            f"{e}"
+        )
+
+        return False
+
+    except (TimedOut, NetworkError) as e:
+
+        print(
+            "⚠️ Callback network error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return False
+
     except Exception as e:
 
         print(
@@ -2530,352 +2217,401 @@ async def edit_callback_message(
         return False
 
 
-@client.on(
-    events.CallbackQuery()
-)
-async def monitor_callback(event):
-    """
-    Обрабатывает кнопки Monitor Bot.
+# ============================================================
+# MONITOR BOT CALLBACK
+#
+# ВАЖНО:
+# Эта функция вызывается python-telegram-bot,
+# НЕ Telethon.
+# ============================================================
 
-    Поддерживает:
+async def handle_monitor_callback(update, context):
 
-        history:<user_id>
-        block:<user_id>
-    """
+    query = update.callback_query
+
+    if query is None:
+        return
 
     try:
 
-        data = event.data
+        await query.answer()
 
-        if not data:
-            return
+    except Exception:
+        pass
 
-        if isinstance(data, bytes):
+    if MY_ID is None:
 
-            data = data.decode(
-                "utf-8",
-                errors="ignore",
-            )
-
-        data = str(data)
-
-        # ----------------------------------------------------
-        # SECURITY
-        # ----------------------------------------------------
-
-        if MY_ID is None:
-
-            await answer_callback(
-                event,
-                "❌ JARVIS ещё не определил владельца.",
-                alert=True,
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # ONLY OWNER
-        # ----------------------------------------------------
-
-        callback_sender_id = safe_int(
-            getattr(
-                event,
-                "sender_id",
-                None,
-            )
+        await answer_callback(
+            query,
+            "❌ JARVIS ещё не определил владельца.",
+            True,
         )
 
-        if (
-            callback_sender_id is not None
-            and callback_sender_id != MY_ID
-        ):
+        return
+
+    callback_sender_id = safe_int(
+        getattr(
+            query.from_user,
+            "id",
+            None,
+        )
+    )
+
+    if callback_sender_id != MY_ID:
+
+        await answer_callback(
+            query,
+            "🚫 Доступ запрещён.",
+            True,
+        )
+
+        return
+
+    data = query.data
+
+    if not data:
+        return
+
+    # ========================================================
+    # HISTORY
+    # ========================================================
+
+    if data.startswith("history:"):
+
+        user_id = safe_int(
+            data.split(":", 1)[1]
+        )
+
+        if not user_id:
 
             await answer_callback(
-                event,
-                "🚫 Доступ запрещён.",
-                alert=True,
+                query,
+                "❌ Некорректный User ID.",
+                True,
             )
 
             return
 
-        # ----------------------------------------------------
-        # HISTORY
-        # ----------------------------------------------------
+        await answer_callback(
+            query,
+            "📖 Загружаю историю...",
+        )
 
-        if data.startswith(
-            "history:"
-        ):
+        history = await show_chat_history(
+            user_id,
+            limit=30,
+        )
 
-            raw_user_id = data.split(
-                ":",
-                1,
-            )[1]
+        await edit_callback_message(
+            query,
+            history,
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🚫 Заблокировать",
+                            callback_data=f"block:{user_id}",
+                        )
+                    ]
+                ]
+            ),
+        )
 
-            user_id = safe_int(
-                raw_user_id
-            )
+        return
 
-            if not user_id:
+    # ========================================================
+    # BLOCK
+    # ========================================================
 
-                await answer_callback(
-                    event,
-                    "❌ Некорректный User ID.",
-                    alert=True,
-                )
+    if data.startswith("block:"):
 
-                return
+        user_id = safe_int(
+            data.split(":", 1)[1]
+        )
+
+        if not user_id:
 
             await answer_callback(
-                event,
-                "📖 Загружаю историю...",
+                query,
+                "❌ Некорректный User ID.",
+                True,
             )
 
-            history = await show_chat_history(
-                user_id,
-                limit=30,
+            return
+
+        if user_id == MY_ID:
+
+            await answer_callback(
+                query,
+                "🛑 Нельзя заблокировать владельца.",
+                True,
             )
+
+            return
+
+        await answer_callback(
+            query,
+            "🚫 Блокирую пользователя...",
+        )
+
+        success = await manual_block_user(
+            user_id=user_id,
+            reason=(
+                "Заблокировано владельцем "
+                "через Monitor Bot"
+            ),
+        )
+
+        if success:
 
             await edit_callback_message(
-                event,
-                history,
+                query,
+                (
+                    "🚫 <b>Пользователь заблокирован</b>\n\n"
+                    f"🆔 User ID: "
+                    f"<code>{user_id}</code>\n\n"
+                    "🛡️ Telegram: заблокирован\n"
+                    "💾 Database: сохранено"
+                ),
                 InlineKeyboardMarkup(
                     [
                         [
                             InlineKeyboardButton(
-                                "🚫 Заблокировать",
-                                callback_data=(
-                                    f"block:{user_id}"
-                                ),
+                                "🔓 Разблокировать",
+                                callback_data=f"unblock:{user_id}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "📖 История",
+                                callback_data=f"history:{user_id}",
+                            )
+                        ],
+                    ]
+                ),
+            )
+
+        else:
+
+            await edit_callback_message(
+                query,
+                (
+                    "❌ <b>Не удалось заблокировать</b>\n\n"
+                    f"🆔 User ID: "
+                    f"<code>{user_id}</code>"
+                ),
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🔄 Попробовать снова",
+                                callback_data=f"block:{user_id}",
                             )
                         ]
                     ]
                 ),
             )
 
-            return
+        return
 
-        # ----------------------------------------------------
-        # BLOCK
-        # ----------------------------------------------------
+    # ========================================================
+    # UNBLOCK
+    # ========================================================
 
-        if data.startswith(
-            "block:"
-        ):
+    if data.startswith("unblock:"):
 
-            raw_user_id = data.split(
-                ":",
-                1,
-            )[1]
+        user_id = safe_int(
+            data.split(":", 1)[1]
+        )
 
-            user_id = safe_int(
-                raw_user_id
-            )
-
-            if not user_id:
-
-                await answer_callback(
-                    event,
-                    "❌ Некорректный User ID.",
-                    alert=True,
-                )
-
-                return
-
-            if (
-                MY_ID is not None
-                and user_id == MY_ID
-            ):
-
-                await answer_callback(
-                    event,
-                    "🛑 Нельзя заблокировать владельца.",
-                    alert=True,
-                )
-
-                return
+        if not user_id:
 
             await answer_callback(
-                event,
-                "🚫 Блокирую пользователя...",
+                query,
+                "❌ Некорректный User ID.",
+                True,
             )
-
-            success = await manual_block_user(
-                user_id=user_id,
-                reason="Заблокировано владельцем через Monitor Bot",
-            )
-
-            if success:
-
-                await edit_callback_message(
-                    event,
-                    (
-                        "🚫 <b>Пользователь заблокирован</b>\n\n"
-                        f"🆔 User ID: "
-                        f"<code>{user_id}</code>\n\n"
-                        "🛡️ Telegram: заблокирован\n"
-                        "💾 Database: сохранено"
-                    ),
-                    InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "🔓 Разблокировать",
-                                    callback_data=(
-                                        f"unblock:{user_id}"
-                                    ),
-                                )
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "📖 История",
-                                    callback_data=(
-                                        f"history:{user_id}"
-                                    ),
-                                )
-                            ],
-                        ]
-                    ),
-                )
-
-            else:
-
-                await edit_callback_message(
-                    event,
-                    (
-                        "❌ <b>Не удалось заблокировать</b>\n\n"
-                        f"🆔 User ID: "
-                        f"<code>{user_id}</code>\n\n"
-                        "Telegram block завершился ошибкой."
-                    ),
-                    InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "🔄 Попробовать снова",
-                                    callback_data=(
-                                        f"block:{user_id}"
-                                    ),
-                                )
-                            ]
-                        ]
-                    ),
-                )
 
             return
-
-        # ----------------------------------------------------
-        # UNBLOCK
-        # ----------------------------------------------------
-
-        if data.startswith(
-            "unblock:"
-        ):
-
-            raw_user_id = data.split(
-                ":",
-                1,
-            )[1]
-
-            user_id = safe_int(
-                raw_user_id
-            )
-
-            if not user_id:
-
-                await answer_callback(
-                    event,
-                    "❌ Некорректный User ID.",
-                    alert=True,
-                )
-
-                return
-
-            await answer_callback(
-                event,
-                "🔓 Разблокирую...",
-            )
-
-            success = await manual_unblock_user(
-                user_id
-            )
-
-            if success:
-
-                await edit_callback_message(
-                    event,
-                    (
-                        "🔓 <b>Пользователь разблокирован</b>\n\n"
-                        f"🆔 User ID: "
-                        f"<code>{user_id}</code>\n\n"
-                        "🛡️ Telegram: разблокирован\n"
-                        "💾 Database: обновлено"
-                    ),
-                    InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "📖 История",
-                                    callback_data=(
-                                        f"history:{user_id}"
-                                    ),
-                                )
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "🚫 Заблокировать",
-                                    callback_data=(
-                                        f"block:{user_id}"
-                                    ),
-                                )
-                            ],
-                        ]
-                    ),
-                )
-
-            else:
-
-                await edit_callback_message(
-                    event,
-                    (
-                        "❌ <b>Не удалось разблокировать</b>\n\n"
-                        f"🆔 User ID: "
-                        f"<code>{user_id}</code>"
-                    ),
-                )
-
-            return
-
-        # ----------------------------------------------------
-        # UNKNOWN CALLBACK
-        # ----------------------------------------------------
 
         await answer_callback(
-            event,
-            "⚠️ Неизвестная команда.",
-            alert=True,
+            query,
+            "🔓 Разблокирую...",
+        )
+
+        success = await manual_unblock_user(
+            user_id
+        )
+
+        if success:
+
+            await edit_callback_message(
+                query,
+                (
+                    "🔓 <b>Пользователь разблокирован</b>\n\n"
+                    f"🆔 User ID: "
+                    f"<code>{user_id}</code>\n\n"
+                    "🛡️ Telegram: разблокирован\n"
+                    "💾 Database: обновлено"
+                ),
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "📖 История",
+                                callback_data=f"history:{user_id}",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🚫 Заблокировать",
+                                callback_data=f"block:{user_id}",
+                            )
+                        ],
+                    ]
+                ),
+            )
+
+        else:
+
+            await edit_callback_message(
+                query,
+                (
+                    "❌ <b>Не удалось разблокировать</b>\n\n"
+                    f"🆔 User ID: "
+                    f"<code>{user_id}</code>"
+                ),
+            )
+
+        return
+
+    await answer_callback(
+        query,
+        "⚠️ Неизвестная команда.",
+        True,
+    )
+
+
+# ============================================================
+# RENDER HEALTH SERVER
+# ============================================================
+
+async def _health_handler(
+    reader,
+    writer,
+):
+
+    try:
+
+        request = await reader.read(4096)
+
+        request_text = request.decode(
+            "utf-8",
+            errors="ignore",
+        )
+
+        if request_text.startswith(
+            "GET /health"
+        ):
+
+            body = (
+                '{"status":"ok","service":"JARVIS","telegram":'
+                f'"{client.is_connected()}"'
+                "}"
+            )
+
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body.encode())}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                f"{body}"
+            )
+
+        else:
+
+            body = "JARVIS ONLINE"
+
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                f"Content-Length: {len(body.encode())}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                f"{body}"
+            )
+
+        writer.write(
+            response.encode()
+        )
+
+        await writer.drain()
+
+    except Exception as e:
+
+        print(
+            "⚠️ Health server error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    finally:
+
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def start_health_server():
+
+    global _health_server
+
+    if _health_server is not None:
+        return
+
+    try:
+
+        _health_server = await asyncio.start_server(
+            _health_handler,
+            host="0.0.0.0",
+            port=RENDER_PORT,
+        )
+
+        print(
+            f"🌐 Health server: 0.0.0.0:{RENDER_PORT}"
         )
 
     except Exception as e:
 
-        print()
         print(
-            "🔥 CALLBACK HANDLER ERROR"
-        )
-
-        print(
+            "⚠️ Health server failed: "
             f"{type(e).__name__}: {e}"
         )
 
-        try:
 
-            await answer_callback(
-                event,
-                "❌ Произошла ошибка.",
-                alert=True,
-            )
+async def stop_health_server():
 
-        except Exception:
-            pass
+    global _health_server
+
+    if _health_server is None:
+        return
+
+    try:
+
+        _health_server.close()
+
+        await _health_server.wait_closed()
+
+    except Exception as e:
+
+        print(
+            "⚠️ Health server stop error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    _health_server = None
 
 
 # ============================================================
@@ -2883,9 +2619,6 @@ async def monitor_callback(event):
 # ============================================================
 
 async def start_telegram():
-    """
-    Запускает Telegram Client.
-    """
 
     global MY_ID
     global MY_USERNAME
@@ -2895,7 +2628,51 @@ async def start_telegram():
         "📱 Запускаем Telegram Client..."
     )
 
-    await client.start()
+    # ========================================================
+    # STRING SESSION
+    # ========================================================
+
+    if TG_SESSION:
+
+        print(
+            "🔐 Проверяем TG_SESSION..."
+        )
+
+        # ВАЖНО:
+        # НЕ используем client.start()
+        # потому что start() может вызвать input()
+        # на Render.
+
+        await client.connect()
+
+        if not await client.is_user_authorized():
+
+            raise RuntimeError(
+                "TG_SESSION существует, "
+                "но Telegram session не авторизована. "
+                "Сгенерируй новую StringSession "
+                "локально и обнови TG_SESSION на Render."
+            )
+
+    else:
+
+        # ====================================================
+        # LOCAL MODE
+        # ====================================================
+
+        print(
+            "📱 TG_SESSION отсутствует."
+        )
+
+        print(
+            "📱 Используем локальную авторизацию."
+        )
+
+        await client.start()
+
+    # ========================================================
+    # GET ACCOUNT
+    # ========================================================
 
     me = await client.get_me()
 
@@ -2921,9 +2698,20 @@ async def start_telegram():
 
     await init_edit_history()
 
-    print(
-        "✅ Telegram Client: ONLINE"
-    )
+    # ========================================================
+    # RENDER HEALTH
+    # ========================================================
+
+    await start_health_server()
+
+    # ========================================================
+    # LOG
+    # ========================================================
+
+    print()
+    print("=" * 60)
+    print("✅ TELEGRAM CLIENT ONLINE")
+    print("=" * 60)
 
     print(
         f"👤 Account: {MY_NAME}"
@@ -2967,6 +2755,14 @@ async def start_telegram():
         f"🎛️ Mode: {get_mode()}"
     )
 
+    print(
+        f"🌐 Health port: {RENDER_PORT}"
+    )
+
+    print(
+        "=" * 60
+    )
+
     return me
 
 
@@ -2975,9 +2771,6 @@ async def start_telegram():
 # ============================================================
 
 async def stop_telegram():
-    """
-    Корректно останавливает Telegram Client.
-    """
 
     print(
         "📱 Останавливаем Telegram..."
@@ -3001,9 +2794,12 @@ async def stop_telegram():
 
     _deleted_batches.clear()
 
+    await stop_health_server()
+
     try:
 
         if client.is_connected():
+
             await client.disconnect()
 
     except Exception as e:
@@ -3023,13 +2819,11 @@ async def stop_telegram():
 # ============================================================
 
 def get_telegram_status():
-    """
-    Возвращает состояние Telegram Client.
-    """
 
     current_mode = get_mode()
 
     return {
+
         "connected": client.is_connected(),
 
         "my_id": MY_ID,
@@ -3067,4 +2861,10 @@ def get_telegram_status():
         "agro_mode": (
             current_mode == AGRO_MODE
         ),
+
+        "health_server": (
+            _health_server is not None
+        ),
+
+        "health_port": RENDER_PORT,
     }
