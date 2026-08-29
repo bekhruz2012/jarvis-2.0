@@ -104,6 +104,8 @@ MY_NAME = None
 
 MONITOR_BOT = None
 
+_telegram_guard_task = None
+
 _health_server = None
 
 
@@ -2616,6 +2618,93 @@ async def stop_health_server():
 
 
 # ============================================================
+# TELEGRAM CONNECTION GUARD
+# ============================================================
+
+async def telegram_connection_guard():
+
+    """
+    Постоянно контролирует Telegram User Client.
+
+    Если соединение пропало — пытается восстановить его.
+    Это особенно важно для Render.
+    """
+
+    print("🛡️ Telegram connection guard: ONLINE")
+
+    while True:
+
+        try:
+
+            if not client.is_connected():
+
+                print(
+                    "⚠️ Telegram connection lost. "
+                    "Reconnecting..."
+                )
+
+                try:
+                    await client.connect()
+
+                except Exception as e:
+
+                    print(
+                        "❌ Telegram reconnect error: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+            else:
+
+                # Небольшой запрос поддерживает активность
+                # соединения и позволяет быстрее обнаружить
+                # проблемы с Telegram.
+
+                try:
+                    await client.get_me()
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ Telegram connection check failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+                    try:
+                        await asyncio.sleep(3)
+                        await client.connect()
+                    except Exception as reconnect_error:
+                        print(
+                            "❌ Telegram reconnect failed: "
+                            f"{type(reconnect_error).__name__}: "
+                            f"{reconnect_error}"
+                        )
+
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+
+            print(
+                "🛡️ Telegram connection guard stopped."
+            )
+
+            raise
+
+        except Exception as e:
+
+            print(
+                "🔥 Telegram guard error: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            await asyncio.sleep(10)
+
+
+# ============================================================
 # START TELEGRAM
 # ============================================================
 
@@ -2642,20 +2731,27 @@ async def start_telegram():
     # TELEGRAM AUTH
     # ========================================================
 
+    # ========================================================
+    # TELEGRAM AUTH
+    # ========================================================
+
     try:
 
         if TG_SESSION:
 
             print("🔐 Используем TG_SESSION из ENV")
 
-            # ВАЖНО:
-            # На Render нельзя использовать client.start(),
-            # потому что он может попытаться запросить код
-            # через input().
-
             await client.connect()
 
-            authorized = await client.is_user_authorized()
+            if not client.is_connected():
+
+                raise RuntimeError(
+                    "Telegram Client не смог подключиться."
+                )
+
+            authorized = (
+                await client.is_user_authorized()
+            )
 
             if not authorized:
 
@@ -2664,13 +2760,42 @@ async def start_telegram():
                     "но Telegram session не авторизована."
                 )
 
+            print("✅ TG_SESSION авторизована")
+            print("🔗 Telegram Client подключён")
+
         else:
 
-            print("🔐 TG_SESSION не найдена.")
-            print("📱 Используется локальная SESSION_NAME.")
+            print("🔐 TG_SESSION не найдена")
+            print("📱 Используется локальная SESSION_NAME")
 
-            # Локально разрешаем интерактивную авторизацию.
             await client.start()
+
+            if not client.is_connected():
+
+                raise RuntimeError(
+                    "Telegram Client не подключён "
+                    "после client.start()."
+                )
+
+            authorized = (
+                await client.is_user_authorized()
+            )
+
+            if not authorized:
+
+                raise RuntimeError(
+                    "Локальная Telegram session "
+                    "не авторизована."
+                )
+
+            print(
+                "✅ Локальная Telegram session "
+                "авторизована"
+            )
+
+            print(
+                "🔗 Telegram Client подключён"
+            )
 
     except Exception as e:
 
@@ -2735,8 +2860,9 @@ async def start_telegram():
     # ========================================================
     # RENDER HEALTH SERVER
     # ========================================================
-
-    await start_health_server()
+    # HTTP/Health server уже запускается в main.py.
+    # НЕ запускаем второй сервер здесь, иначе будет:
+    # OSError: [Errno 98] address already in use
 
     # ========================================================
     # EVENT HANDLERS
@@ -2768,7 +2894,7 @@ async def start_telegram():
     )
 
     print()
-    print("🌐 Render Health Server: ONLINE")
+    print("🌐 Render Health Server: managed by main.py")
     print(f"🌐 Port: {RENDER_PORT}")
     print("📡 Telegram event listener: ONLINE")
     print("📩 Incoming messages: ENABLED")
@@ -2779,6 +2905,41 @@ async def start_telegram():
     print("🤖 AutoReply: ENABLED")
     print()
     print("=" * 70)
+
+    # ========================================================
+    # TELEGRAM CONNECTION GUARD
+    # ========================================================
+
+    global _telegram_guard_task
+
+    try:
+
+        if (
+            "_telegram_guard_task" in globals()
+            and _telegram_guard_task is not None
+            and not _telegram_guard_task.done()
+        ):
+
+            print(
+                "🛡️ Telegram connection guard: already running"
+            )
+
+        else:
+
+            _telegram_guard_task = asyncio.create_task(
+                telegram_connection_guard()
+            )
+
+            print(
+                "🛡️ Telegram connection guard: STARTED"
+            )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Failed to start Telegram guard: "
+            f"{type(e).__name__}: {e}"
+        )
 
     return me
 

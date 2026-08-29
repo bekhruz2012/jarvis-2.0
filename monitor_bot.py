@@ -1,227 +1,449 @@
-from typing import Optional
+import asyncio
+import logging
+import os
+import time
+from collections import deque
+from datetime import datetime
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-
+from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
-)
-
-from config import (
-    BOT_TOKEN,
-    OWNER_ID,
-    MONITOR_ENABLED,
-)
-
-from ai import (
-    get_mode,
-    set_normal_mode,
-    set_agro_mode,
-    get_agro_remaining,
-)
-
-from security import (
-    set_security_enabled,
-    is_security_enabled,
-)
-
-from autoreply import (
-    get_autoreply_status,
-    get_autoreply_settings_runtime,
-    get_current_settings,
-    set_autoreply_settings_runtime,
-    cancel_all_autoreplies,
-    approve_pending_reply,
-    deny_pending_reply,
-    get_pending_reply,
-    set_pending_reply_text,
 )
 
 
 # ============================================================
-# RUNTIME
+# CONFIG
 # ============================================================
 
-_monitoring_enabled = bool(
-    MONITOR_ENABLED
+try:
+    from config import (
+        TELEGRAM_BOT_TOKEN,
+        OWNER_ID,
+        SECURITY_ENABLED,
+    )
+except ImportError:
+
+    TELEGRAM_BOT_TOKEN = os.getenv(
+        "TELEGRAM_BOT_TOKEN",
+        os.getenv("BOT_TOKEN", ""),
+    )
+
+    OWNER_ID = int(
+        os.getenv("OWNER_ID", "0")
+    )
+
+    SECURITY_ENABLED = (
+        os.getenv(
+            "SECURITY_ENABLED",
+            "true",
+        ).lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    )
+
+
+BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("BOT_TOKEN")
+    or TELEGRAM_BOT_TOKEN
 )
 
-_monitor_application = None
-
-_editing_reply_id = None
+try:
+    OWNER_ID = int(
+        os.getenv("OWNER_ID") or OWNER_ID
+    )
+except Exception:
+    OWNER_ID = 0
 
 
 # ============================================================
-# MONITORING
+# OPTIONAL IMPORTS
 # ============================================================
 
-def set_monitoring_enabled(
-    enabled: bool,
+try:
+    from security import (
+        is_security_enabled,
+        set_security_enabled,
+    )
+except Exception:
+
+    def is_security_enabled():
+        return bool(SECURITY_ENABLED)
+
+    def set_security_enabled(value):
+        return None
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
+)
+
+logger = logging.getLogger("JARVIS_MONITOR")
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+MONITORING_ENABLED = True
+
+AUTOREPLY_MODE = "auto"
+AUTOREPLY_DELAY = 0
+
+START_TIME = time.time()
+
+LAST_HEARTBEAT = time.time()
+
+LAST_TELEGRAM_EVENT = None
+
+LAST_ERROR = None
+
+LAST_SECURITY_EVENT = None
+
+LAST_AUTOREPLY_EVENT = None
+
+LAST_AI_EVENT = None
+
+LAST_DATABASE_EVENT = None
+
+
+STATS = {
+    "messages": 0,
+    "scheduled": 0,
+    "replies": 0,
+    "cancelled": 0,
+    "errors": 0,
+    "security_blocks": 0,
+    "security_allows": 0,
+    "ai_requests": 0,
+    "ai_errors": 0,
+    "database_errors": 0,
+    "reconnects": 0,
+}
+
+
+EVENT_LOG = deque(maxlen=200)
+
+
+# ============================================================
+# EXTERNAL CALLBACKS
+# ============================================================
+
+_SECURITY_GETTER = None
+_SECURITY_SETTER = None
+
+
+def register_security_callbacks(
+    getter=None,
+    setter=None,
 ):
-    global _monitoring_enabled
+    global _SECURITY_GETTER
+    global _SECURITY_SETTER
 
-    _monitoring_enabled = bool(
-        enabled
-    )
-
-    print(
-        f"📡 Monitoring: "
-        f"{'ON' if _monitoring_enabled else 'OFF'}"
-    )
-
-
-def is_monitoring_enabled() -> bool:
-
-    return _monitoring_enabled
+    _SECURITY_GETTER = getter
+    _SECURITY_SETTER = setter
 
 
 # ============================================================
-# OWNER
+# EVENT API
 # ============================================================
 
-def is_owner(
-    update: Update,
-) -> bool:
+def record_event(
+    event_type,
+    message,
+    level="INFO",
+):
+    global LAST_ERROR
+    global LAST_SECURITY_EVENT
+    global LAST_AUTOREPLY_EVENT
+    global LAST_AI_EVENT
+    global LAST_DATABASE_EVENT
+    global LAST_TELEGRAM_EVENT
 
-    user = update.effective_user
+    now = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
-    if user is None:
-        return False
+    item = {
+        "time": now,
+        "type": event_type,
+        "level": level,
+        "message": str(message),
+    }
 
-    return user.id == OWNER_ID
+    EVENT_LOG.append(item)
+
+    if event_type == "error":
+        LAST_ERROR = item
+
+    elif event_type == "security":
+        LAST_SECURITY_EVENT = item
+
+    elif event_type == "autoreply":
+        LAST_AUTOREPLY_EVENT = item
+
+    elif event_type == "ai":
+        LAST_AI_EVENT = item
+
+    elif event_type == "database":
+        LAST_DATABASE_EVENT = item
+
+    elif event_type == "telegram":
+        LAST_TELEGRAM_EVENT = item
 
 
-async def owner_only(
-    update: Update,
-) -> bool:
+def monitor_event(
+    event_type,
+    message,
+    level="INFO",
+):
+    record_event(
+        event_type,
+        message,
+        level,
+    )
 
-    if is_owner(update):
-        return True
+    logger.info(
+        "[%s] %s",
+        event_type.upper(),
+        message,
+    )
+
+
+def monitor_error(message):
+    STATS["errors"] += 1
+
+    record_event(
+        "error",
+        message,
+        "ERROR",
+    )
+
+    logger.error(
+        "%s",
+        message,
+    )
+
+
+def monitor_security(
+    message,
+    blocked=False,
+):
+    if blocked:
+        STATS["security_blocks"] += 1
+    else:
+        STATS["security_allows"] += 1
+
+    record_event(
+        "security",
+        message,
+        "WARNING" if blocked else "INFO",
+    )
+
+
+def monitor_autoreply(message):
+    record_event(
+        "autoreply",
+        message,
+        "INFO",
+    )
+
+
+def monitor_ai(
+    message,
+    error=False,
+):
+    if error:
+        STATS["ai_errors"] += 1
+    else:
+        STATS["ai_requests"] += 1
+
+    record_event(
+        "ai",
+        message,
+        "ERROR" if error else "INFO",
+    )
+
+
+def monitor_database(
+    message,
+    error=False,
+):
+    if error:
+        STATS["database_errors"] += 1
+
+    record_event(
+        "database",
+        message,
+        "ERROR" if error else "INFO",
+    )
+
+
+def monitor_telegram(message):
+    record_event(
+        "telegram",
+        message,
+        "INFO",
+    )
+
+
+# ============================================================
+# HEARTBEAT
+# ============================================================
+
+def heartbeat():
+    global LAST_HEARTBEAT
+
+    LAST_HEARTBEAT = time.time()
+
+
+def seconds_since_heartbeat():
+    return int(
+        time.time() - LAST_HEARTBEAT
+    )
+
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+def get_security_status():
 
     try:
 
-        if update.callback_query:
+        if _SECURITY_GETTER:
 
-            await update.callback_query.answer(
-                "⛔ Доступ запрещён.",
-                show_alert=True,
+            return bool(
+                _SECURITY_GETTER()
             )
 
-        elif update.message:
+        return bool(
+            is_security_enabled()
+        )
 
-            await update.message.reply_text(
-                "⛔ Доступ запрещён."
+    except Exception:
+
+        return bool(
+            SECURITY_ENABLED
+        )
+
+
+def set_security_status(value):
+
+    global SECURITY_ENABLED
+
+    SECURITY_ENABLED = bool(value)
+
+    try:
+
+        if _SECURITY_SETTER:
+
+            _SECURITY_SETTER(
+                bool(value)
+            )
+
+        else:
+
+            set_security_enabled(
+                bool(value)
             )
 
     except Exception as e:
 
-        print(
-            f"⚠️ Owner check error: {e}"
+        monitor_error(
+            f"Security save error: {e}"
         )
 
-    return False
+
+# ============================================================
+# OWNER CHECK
+# ============================================================
+
+async def owner_only(update):
+
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    if not OWNER_ID:
+
+        logger.error(
+            "OWNER_ID is not configured."
+        )
+
+        return False
+
+    if user.id != OWNER_ID:
+
+        try:
+
+            if update.callback_query:
+
+                await update.callback_query.answer(
+                    "⛔ Доступ запрещён.",
+                    show_alert=True,
+                )
+
+            elif update.message:
+
+                await update.message.reply_text(
+                    "⛔ Доступ запрещён."
+                )
+
+        except Exception:
+            pass
+
+        return False
+
+    return True
 
 
 # ============================================================
-# FORMAT TIME
+# UPTIME
 # ============================================================
 
-def format_time(
-    seconds: int,
-) -> str:
+def uptime_text():
 
-    seconds = max(
-        0,
-        int(seconds),
+    seconds = int(
+        time.time() - START_TIME
     )
+
+    days = seconds // 86400
+    seconds %= 86400
+
+    hours = seconds // 3600
+    seconds %= 3600
 
     minutes = seconds // 60
-
     seconds %= 60
 
-    if minutes:
-
-        return (
-            f"{minutes} мин. "
-            f"{seconds} сек."
-        )
-
-    return f"{seconds} сек."
-
-
-# ============================================================
-# JARVIS MODE
-# ============================================================
-
-def mode_text() -> str:
-
-    mode = get_mode()
-
-    if mode == "agro":
-
-        remaining = get_agro_remaining()
-
-        return (
-            "🔴 AGRO\n"
-            f"⏳ Осталось: "
-            f"{format_time(remaining)}"
-        )
-
-    return "🟢 NORMAL"
-
-
-# ============================================================
-# AUTOREPLY MODE TEXT
-# ============================================================
-
-def autoreply_mode_text(
-    mode: str,
-) -> str:
-
-    if mode == "auto":
-
-        return "🤖 АВТО"
-
-    if mode == "ask":
-
-        return "❓ СПРОСИТЬ РАЗРЕШЕНИЕ"
-
-    return "✋ ВЫКЛЮЧЕНО"
-
-
-# ============================================================
-# AUTOREPLY STATUS TEXT
-# ============================================================
-
-def autoreply_status_text() -> str:
-
-    settings = (
-        get_autoreply_settings_runtime()
-    )
-
-    mode = settings.get(
-        "mode",
-        "off",
-    )
-
-    delay = settings.get(
-        "delay_minutes",
-        0,
-    )
-
     return (
-        f"🤖 Auto Reply: "
-        f"<b>{autoreply_mode_text(mode)}</b>\n"
-        f"⏱ Задержка: "
-        f"<b>{delay} мин.</b>"
+        f"{days}д "
+        f"{hours}ч "
+        f"{minutes}м "
+        f"{seconds}с"
     )
 
 
@@ -231,60 +453,56 @@ def autoreply_status_text() -> str:
 
 def main_keyboard():
 
+    security_text = (
+        "🛡 Security: ON"
+        if get_security_status()
+        else "🛡 Security: OFF"
+    )
+
+    monitoring_text = (
+        "👁 Monitoring: ON"
+        if MONITORING_ENABLED
+        else "👁 Monitoring: OFF"
+    )
+
     return InlineKeyboardMarkup(
         [
+
             [
                 InlineKeyboardButton(
-                    "🤖 Автоответчик",
-                    callback_data="autoreply_menu",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🛡 Security "
-                    + (
-                        "🟢"
-                        if is_security_enabled()
-                        else "🔴"
-                    ),
+                    security_text,
                     callback_data="toggle_security",
-                ),
+                )
+            ],
+
+            [
                 InlineKeyboardButton(
-                    "👁 Monitoring "
-                    + (
-                        "🟢"
-                        if is_monitoring_enabled()
-                        else "🔴"
-                    ),
+                    monitoring_text,
                     callback_data="toggle_monitoring",
-                ),
+                )
             ],
+
             [
                 InlineKeyboardButton(
-                    "🟢 NORMAL",
-                    callback_data="normal",
-                ),
-                InlineKeyboardButton(
-                    "🔴 AGRO",
-                    callback_data="agro",
-                ),
+                    "🤖 AutoReply",
+                    callback_data="autoreply",
+                )
             ],
+
             [
                 InlineKeyboardButton(
-                    "📊 Statistics",
-                    callback_data="statistics",
-                ),
-                InlineKeyboardButton(
-                    "📈 Analytics",
-                    callback_data="analytics",
-                ),
+                    "📊 Status",
+                    callback_data="status",
+                )
             ],
+
             [
                 InlineKeyboardButton(
-                    "🔄 Refresh",
-                    callback_data="refresh",
-                ),
+                    "📡 Monitor",
+                    callback_data="monitor_status",
+                )
             ],
+
         ]
     )
 
@@ -295,200 +513,256 @@ def main_keyboard():
 
 def autoreply_keyboard():
 
-    settings = (
-        get_autoreply_settings_runtime()
-    )
-
-    mode = settings.get(
-        "mode",
-        "off",
-    )
-
-    delay = settings.get(
-        "delay_minutes",
-        0,
-    )
-
     return InlineKeyboardMarkup(
         [
+
             [
                 InlineKeyboardButton(
-                    "🤖 Авто "
-                    + (
-                        "🟢"
-                        if mode == "auto"
-                        else ""
-                    ),
-                    callback_data="ar_mode_auto",
+                    "▶️ AUTO",
+                    callback_data="ar_auto",
+                ),
+
+                InlineKeyboardButton(
+                    "⏸ OFF",
+                    callback_data="ar_off",
                 ),
             ],
+
             [
                 InlineKeyboardButton(
-                    "❓ Спросить разрешение "
-                    + (
-                        "🟢"
-                        if mode == "ask"
-                        else ""
-                    ),
-                    callback_data="ar_mode_ask",
+                    "⏱ 0 мин",
+                    callback_data="ar_delay_0",
+                ),
+
+                InlineKeyboardButton(
+                    "⏱ 5 мин",
+                    callback_data="ar_delay_5",
                 ),
             ],
+
             [
                 InlineKeyboardButton(
-                    "✋ Выключено "
-                    + (
-                        "🟢"
-                        if mode == "off"
-                        else ""
-                    ),
-                    callback_data="ar_mode_off",
+                    "⏱ 15 мин",
+                    callback_data="ar_delay_15",
+                ),
+
+                InlineKeyboardButton(
+                    "⏱ 30 мин",
+                    callback_data="ar_delay_30",
                 ),
             ],
+
             [
                 InlineKeyboardButton(
-                    f"⏱ Задержка: {delay} мин.",
-                    callback_data="ar_delay_menu",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ Отменить активные ответы",
+                    "⏹ Cancel",
                     callback_data="ar_cancel",
-                ),
+                )
             ],
+
             [
                 InlineKeyboardButton(
                     "⬅️ Назад",
-                    callback_data="refresh",
-                ),
-            ],
-        ]
-    )
-
-
-# ============================================================
-# DELAY KEYBOARD
-# ============================================================
-
-def delay_keyboard():
-
-    delays = [
-        0,
-        5,
-        10,
-        15,
-        20,
-        30,
-        60,
-    ]
-
-    rows = []
-
-    for i in range(
-        0,
-        len(delays),
-        2,
-    ):
-
-        row = []
-
-        for delay in delays[
-            i:i + 2
-        ]:
-
-            row.append(
-                InlineKeyboardButton(
-                    f"{delay} мин.",
-                    callback_data=f"ar_delay_{delay}",
+                    callback_data="back",
                 )
-            )
+            ],
 
-        rows.append(row)
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="autoreply_menu",
-            ),
         ]
     )
 
-    return InlineKeyboardMarkup(
-        rows
-    )
-
 
 # ============================================================
-# STATUS TEXT
+# STATUS
 # ============================================================
 
-def status_text() -> str:
+def status_text():
 
-    settings = (
-        get_autoreply_settings_runtime()
+    security = (
+        "🟢 ON"
+        if get_security_status()
+        else "🔴 OFF"
     )
 
-    mode = settings.get(
-        "mode",
-        "off",
+    monitoring = (
+        "🟢 ON"
+        if MONITORING_ENABLED
+        else "🔴 OFF"
     )
 
-    delay = settings.get(
-        "delay_minutes",
-        0,
-    )
+    heartbeat_age = seconds_since_heartbeat()
 
-    status = get_autoreply_status()
-
-    pending = status.get(
-        "pending_chats",
-        0,
-    )
-
-    scheduled = status.get(
-        "total_scheduled",
-        0,
-    )
-
-    replies = status.get(
-        "total_replies",
-        0,
-    )
-
-    cancelled = status.get(
-        "total_cancelled",
-        0,
-    )
-
-    errors = status.get(
-        "total_errors",
-        0,
+    heartbeat_status = (
+        "🟢 HEALTHY"
+        if heartbeat_age < 180
+        else "🟡 STALE"
+        if heartbeat_age < 600
+        else "🔴 DEAD"
     )
 
     return (
         "🤖 <b>JARVIS 2.0</b>\n\n"
+
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 Auto Reply: "
-        f"<b>{autoreply_mode_text(mode)}</b>\n"
+
+        f"🤖 AutoReply: "
+        f"<b>{AUTOREPLY_MODE.upper()}</b>\n"
+
         f"⏱ Delay: "
-        f"<b>{delay} мин.</b>\n"
+        f"<b>{AUTOREPLY_DELAY} мин.</b>\n"
+
         f"🛡 Security: "
-        f"{'🟢 ON' if is_security_enabled() else '🔴 OFF'}\n"
+        f"<b>{security}</b>\n"
+
         f"👁 Monitoring: "
-        f"{'🟢 ON' if is_monitoring_enabled() else '🔴 OFF'}\n"
-        f"🎛 Mode: {mode_text()}\n"
+        f"<b>{monitoring}</b>\n"
+
+        f"💓 Heartbeat: "
+        f"<b>{heartbeat_status}</b>\n"
+
+        f"⏱ Uptime: "
+        f"<b>{uptime_text()}</b>\n"
+
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"⏳ Active timers: {pending}\n"
-        f"📨 Scheduled: {scheduled}\n"
-        f"💬 Replies: {replies}\n"
-        f"⏹ Cancelled: {cancelled}\n"
-        f"❌ Errors: {errors}\n"
+
+        f"📩 Messages: "
+        f"<b>{STATS['messages']}</b>\n"
+
+        f"⏳ Scheduled: "
+        f"<b>{STATS['scheduled']}</b>\n"
+
+        f"💬 Replies: "
+        f"<b>{STATS['replies']}</b>\n"
+
+        f"⏹ Cancelled: "
+        f"<b>{STATS['cancelled']}</b>\n"
+
+        f"❌ Errors: "
+        f"<b>{STATS['errors']}</b>\n\n"
+
+        f"🛡 Security blocks: "
+        f"<b>{STATS['security_blocks']}</b>\n"
+
+        f"🧠 AI requests: "
+        f"<b>{STATS['ai_requests']}</b>\n"
+
+        f"🧠 AI errors: "
+        f"<b>{STATS['ai_errors']}</b>\n"
+
+        f"💾 DB errors: "
+        f"<b>{STATS['database_errors']}</b>\n"
+
+        f"🔄 Reconnects: "
+        f"<b>{STATS['reconnects']}</b>"
     )
 
 
 # ============================================================
-# START
+# MONITOR STATUS
+# ============================================================
+
+def monitor_status_text():
+
+    last_event = (
+        EVENT_LOG[-1]
+        if EVENT_LOG
+        else None
+    )
+
+    if last_event:
+
+        last_event_text = (
+            f"{last_event['time']}\n"
+            f"{last_event['type']}: "
+            f"{last_event['message']}"
+        )
+
+    else:
+
+        last_event_text = (
+            "Нет событий."
+        )
+
+    return (
+        "📡 <b>JARVIS MONITOR</b>\n\n"
+
+        f"💓 Heartbeat: "
+        f"<b>{seconds_since_heartbeat()} сек. назад</b>\n"
+
+        f"⏱ Uptime: "
+        f"<b>{uptime_text()}</b>\n"
+
+        f"📊 Events: "
+        f"<b>{len(EVENT_LOG)}</b>\n"
+
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"📩 Messages: "
+        f"<b>{STATS['messages']}</b>\n"
+
+        f"🛡 Blocks: "
+        f"<b>{STATS['security_blocks']}</b>\n"
+
+        f"❌ Errors: "
+        f"<b>{STATS['errors']}</b>\n"
+
+        f"🧠 AI errors: "
+        f"<b>{STATS['ai_errors']}</b>\n"
+
+        f"💾 DB errors: "
+        f"<b>{STATS['database_errors']}</b>\n"
+
+        f"🔄 Reconnects: "
+        f"<b>{STATS['reconnects']}</b>\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "📝 <b>Последнее событие:</b>\n"
+        f"{last_event_text}"
+    )
+
+
+# ============================================================
+# LOGS TEXT
+# ============================================================
+
+def logs_text(limit=15):
+
+    events = list(EVENT_LOG)[-limit:]
+
+    if not events:
+
+        return (
+            "📋 <b>JARVIS LOGS</b>\n\n"
+            "Лог пуст."
+        )
+
+    lines = [
+        "📋 <b>JARVIS LOGS</b>",
+        "",
+    ]
+
+    for event in reversed(events):
+
+        icon = {
+            "ERROR": "🔴",
+            "WARNING": "🟡",
+            "INFO": "🟢",
+        }.get(
+            event["level"],
+            "⚪",
+        )
+
+        lines.append(
+            f"{icon} "
+            f"<code>{event['time']}</code> "
+            f"<b>{event['type']}</b>\n"
+            f"{event['message']}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# /START
 # ============================================================
 
 async def cmd_start(
@@ -507,7 +781,7 @@ async def cmd_start(
 
 
 # ============================================================
-# STATUS
+# /STATUS
 # ============================================================
 
 async def cmd_status(
@@ -526,10 +800,10 @@ async def cmd_status(
 
 
 # ============================================================
-# AUTOREPLY COMMAND
+# /STATS
 # ============================================================
 
-async def cmd_autoreply(
+async def cmd_stats(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -537,60 +811,50 @@ async def cmd_autoreply(
     if not await owner_only(update):
         return
 
-    if context.args:
-
-        value = (
-            context.args[0]
-            .lower()
-        )
-
-        if value == "auto":
-
-            await set_autoreply_settings_runtime(
-                "auto",
-                None,
-            )
-
-        elif value in {
-            "ask",
-            "question",
-        }:
-
-            await set_autoreply_settings_runtime(
-                "ask",
-                None,
-            )
-
-        elif value in {
-            "off",
-            "manual",
-        }:
-
-            await set_autoreply_settings_runtime(
-                "off",
-                None,
-            )
-
-        else:
-
-            await update.message.reply_text(
-                "Используй:\n\n"
-                "/autoreply auto\n"
-                "/autoreply ask\n"
-                "/autoreply off"
-            )
-
-            return
-
     await update.message.reply_text(
-        autoreply_status_text(),
+        status_text(),
         parse_mode="HTML",
-        reply_markup=autoreply_keyboard(),
     )
 
 
 # ============================================================
-# SECURITY COMMAND
+# /LOGS
+# ============================================================
+
+async def cmd_logs(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await owner_only(update):
+        return
+
+    await update.message.reply_text(
+        logs_text(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /MONITOR_STATUS
+# ============================================================
+
+async def cmd_monitor_status(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not await owner_only(update):
+        return
+
+    await update.message.reply_text(
+        monitor_status_text(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# /SECURITY
 # ============================================================
 
 async def cmd_security(
@@ -605,6 +869,7 @@ async def cmd_security(
 
         value = (
             context.args[0]
+            .strip()
             .lower()
         )
 
@@ -612,21 +877,19 @@ async def cmd_security(
             "on",
             "1",
             "true",
+            "enable",
         }:
 
-            set_security_enabled(
-                True
-            )
+            set_security_status(True)
 
         elif value in {
             "off",
             "0",
             "false",
+            "disable",
         }:
 
-            set_security_enabled(
-                False
-            )
+            set_security_status(False)
 
     await update.message.reply_text(
         status_text(),
@@ -636,13 +899,15 @@ async def cmd_security(
 
 
 # ============================================================
-# MONITORING COMMAND
+# /MONITOR
 # ============================================================
 
-async def cmd_monitoring(
+async def cmd_monitor(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
+    global MONITORING_ENABLED
 
     if not await owner_only(update):
         return
@@ -651,6 +916,7 @@ async def cmd_monitoring(
 
         value = (
             context.args[0]
+            .strip()
             .lower()
         )
 
@@ -658,21 +924,19 @@ async def cmd_monitoring(
             "on",
             "1",
             "true",
+            "enable",
         }:
 
-            set_monitoring_enabled(
-                True
-            )
+            MONITORING_ENABLED = True
 
         elif value in {
             "off",
             "0",
             "false",
+            "disable",
         }:
 
-            set_monitoring_enabled(
-                False
-            )
+            MONITORING_ENABLED = False
 
     await update.message.reply_text(
         status_text(),
@@ -682,234 +946,107 @@ async def cmd_monitoring(
 
 
 # ============================================================
-# NORMAL COMMAND
+# /AUTOREPLY
 # ============================================================
 
-async def cmd_normal(
+async def cmd_autoreply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if not await owner_only(update):
-        return
-
-    set_normal_mode()
-
-    await update.message.reply_text(
-        status_text(),
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ============================================================
-# AGRO COMMAND
-# ============================================================
-
-async def cmd_agro(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+    global AUTOREPLY_MODE
+    global AUTOREPLY_DELAY
 
     if not await owner_only(update):
         return
-
-    minutes = 30
 
     if context.args:
 
-        try:
+        value = (
+            context.args[0]
+            .strip()
+            .lower()
+        )
 
-            minutes = int(
-                context.args[0]
-            )
+        if value in {
+            "on",
+            "auto",
+            "enable",
+        }:
 
-        except ValueError:
+            AUTOREPLY_MODE = "auto"
 
-            minutes = 30
+        elif value in {
+            "off",
+            "disable",
+        }:
 
-    minutes = max(
-        1,
-        min(
-            minutes,
-            30,
-        ),
+            AUTOREPLY_MODE = "off"
+
+        else:
+
+            try:
+
+                delay = int(value)
+
+                if delay >= 0:
+
+                    AUTOREPLY_DELAY = delay
+                    AUTOREPLY_MODE = "auto"
+
+            except ValueError:
+
+                pass
+
+    monitor_autoreply(
+        f"AutoReply: "
+        f"{AUTOREPLY_MODE}, "
+        f"delay={AUTOREPLY_DELAY}m"
     )
-
-    set_agro_mode(
-        minutes
-    )
-
-    await update.message.reply_text(
-        status_text(),
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ============================================================
-# STATISTICS COMMAND
-# ============================================================
-
-async def cmd_stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await owner_only(update):
-        return
-
-    status = get_autoreply_status()
-
-    await update.message.reply_text(
-        (
-            "📊 <b>JARVIS STATISTICS</b>\n\n"
-            f"📨 Scheduled: "
-            f"{status.get('total_scheduled', 0)}\n"
-            f"💬 Replies: "
-            f"{status.get('total_replies', 0)}\n"
-            f"⏹ Cancelled: "
-            f"{status.get('total_cancelled', 0)}\n"
-            f"❌ Errors: "
-            f"{status.get('total_errors', 0)}\n"
-            f"⏳ Active: "
-            f"{status.get('pending_chats', 0)}"
-        ),
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
-
-
-# ============================================================
-# ANALYTICS COMMAND
-# ============================================================
-
-async def cmd_analytics(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not await owner_only(update):
-        return
-
-    status = get_autoreply_status()
-
-    scheduled = status.get(
-        "total_scheduled",
-        0,
-    )
-
-    replies = status.get(
-        "total_replies",
-        0,
-    )
-
-    cancelled = status.get(
-        "total_cancelled",
-        0,
-    )
-
-    errors = status.get(
-        "total_errors",
-        0,
-    )
-
-    if scheduled:
-
-        reply_rate = (
-            replies / scheduled
-        ) * 100
-
-        cancel_rate = (
-            cancelled / scheduled
-        ) * 100
-
-    else:
-
-        reply_rate = 0
-        cancel_rate = 0
 
     await update.message.reply_text(
         (
-            "📈 <b>JARVIS ANALYTICS</b>\n\n"
-            f"📨 Scheduled: {scheduled}\n"
-            f"💬 Replies: {replies}\n"
-            f"⏹ Cancelled: {cancelled}\n"
-            f"❌ Errors: {errors}\n\n"
-            f"📊 Reply rate: "
-            f"{reply_rate:.1f}%\n"
-            f"📉 Cancel rate: "
-            f"{cancel_rate:.1f}%"
+            "🤖 <b>AUTOREPLY SETTINGS</b>\n\n"
+            f"Mode: <b>{AUTOREPLY_MODE}</b>\n"
+            f"Delay: <b>{AUTOREPLY_DELAY} min.</b>"
         ),
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=autoreply_keyboard(),
     )
 
 
 # ============================================================
-# PENDING REPLY KEYBOARD
+# CALLBACK HANDLER
 # ============================================================
 
-def pending_reply_keyboard(
-    reply_id,
-):
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Разрешить",
-                    callback_data=f"reply_approve:{reply_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "✏️ Изменить",
-                    callback_data=f"reply_edit:{reply_id}",
-                ),
-                InlineKeyboardButton(
-                    "❌ Отказать",
-                    callback_data=f"reply_deny:{reply_id}",
-                ),
-            ],
-        ]
-    )
-
-
-# ============================================================
-# BUTTON HANDLER
-# ============================================================
-
-async def button_handler(
+async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global _editing_reply_id
+    global MONITORING_ENABLED
+    global AUTOREPLY_MODE
+    global AUTOREPLY_DELAY
 
     query = update.callback_query
 
-    if query is None:
+    if not query:
         return
 
-    if query.from_user.id != OWNER_ID:
-
-        await query.answer(
-            "⛔ Доступ запрещён.",
-            show_alert=True,
-        )
-
+    if not await owner_only(update):
         return
 
     await query.answer()
 
     action = query.data
 
-    # ========================================================
-    # REFRESH
-    # ========================================================
+    # SECURITY
 
-    if action == "refresh":
+    if action == "toggle_security":
+
+        set_security_status(
+            not get_security_status()
+        )
 
         await query.edit_message_text(
             status_text(),
@@ -919,188 +1056,143 @@ async def button_handler(
 
         return
 
-    # ========================================================
+    # MONITORING
+
+    if action == "toggle_monitoring":
+
+        MONITORING_ENABLED = (
+            not MONITORING_ENABLED
+        )
+
+        await query.edit_message_text(
+            status_text(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
+    # STATUS
+
+    if action == "status":
+
+        await query.edit_message_text(
+            status_text(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
+    # MONITOR STATUS
+
+    if action == "monitor_status":
+
+        await query.edit_message_text(
+            monitor_status_text(),
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
     # AUTOREPLY MENU
-    # ========================================================
 
-    if action == "autoreply_menu":
+    if action == "autoreply":
 
         await query.edit_message_text(
-            "🤖 <b>НАСТРОЙКИ АВТООТВЕТЧИКА</b>\n\n"
-            f"{autoreply_status_text()}\n\n"
-            "Выберите режим:",
+            (
+                "🤖 <b>AUTOREPLY SETTINGS</b>\n\n"
+                f"Mode: <b>{AUTOREPLY_MODE}</b>\n"
+                f"Delay: <b>{AUTOREPLY_DELAY} min.</b>"
+            ),
             parse_mode="HTML",
             reply_markup=autoreply_keyboard(),
         )
 
         return
 
-    # ========================================================
     # AUTO
-    # ========================================================
 
-    if action == "ar_mode_auto":
+    if action == "ar_auto":
 
-        settings = (
-            get_autoreply_settings_runtime()
-        )
+        AUTOREPLY_MODE = "auto"
 
-        delay = settings.get(
-            "delay_minutes",
-            0,
-        )
-
-        await set_autoreply_settings_runtime(
-            "auto",
-            delay,
+        monitor_autoreply(
+            "AutoReply enabled"
         )
 
         await query.edit_message_text(
-            "🤖 <b>АВТО</b>\n\n"
-            "JARVIS самостоятельно генерирует "
-            "и отправляет ответы.",
+            (
+                "🤖 <b>AUTOREPLY ENABLED</b>\n\n"
+                f"Delay: "
+                f"<b>{AUTOREPLY_DELAY} мин.</b>"
+            ),
             parse_mode="HTML",
             reply_markup=autoreply_keyboard(),
         )
 
         return
 
-    # ========================================================
-    # ASK
-    # ========================================================
-
-    if action == "ar_mode_ask":
-
-        settings = (
-            get_autoreply_settings_runtime()
-        )
-
-        delay = settings.get(
-            "delay_minutes",
-            0,
-        )
-
-        await set_autoreply_settings_runtime(
-            "ask",
-            delay,
-        )
-
-        await query.edit_message_text(
-            "❓ <b>СПРОСИТЬ РАЗРЕШЕНИЕ</b>\n\n"
-            "JARVIS сначала создаст предложенный "
-            "ответ и отправит его тебе на проверку.\n\n"
-            "Без твоего разрешения ответ не уйдёт.",
-            parse_mode="HTML",
-            reply_markup=autoreply_keyboard(),
-        )
-
-        return
-
-    # ========================================================
     # OFF
-    # ========================================================
 
-    if action == "ar_mode_off":
+    if action == "ar_off":
 
-        settings = (
-            get_autoreply_settings_runtime()
+        AUTOREPLY_MODE = "off"
+
+        monitor_autoreply(
+            "AutoReply disabled"
         )
-
-        delay = settings.get(
-            "delay_minutes",
-            0,
-        )
-
-        await set_autoreply_settings_runtime(
-            "off",
-            delay,
-        )
-
-        await cancel_all_autoreplies()
 
         await query.edit_message_text(
-            "✋ <b>РУЧНОЙ РЕЖИМ</b>\n\n"
-            "JARVIS больше не будет "
-            "самостоятельно отвечать.",
+            "⏸️ <b>AUTOREPLY OFF</b>",
             parse_mode="HTML",
             reply_markup=autoreply_keyboard(),
         )
 
         return
 
-    # ========================================================
-    # DELAY MENU
-    # ========================================================
+    # DELAYS
 
-    if action == "ar_delay_menu":
+    delays = {
+        "ar_delay_0": 0,
+        "ar_delay_5": 5,
+        "ar_delay_15": 15,
+        "ar_delay_30": 30,
+    }
 
-        settings = (
-            get_autoreply_settings_runtime()
-        )
+    if action in delays:
 
-        current = settings.get(
-            "delay_minutes",
-            0,
-        )
+        AUTOREPLY_DELAY = delays[action]
 
-        await query.edit_message_text(
-            "⏱ <b>ЗАДЕРЖКА АВТООТВЕТА</b>\n\n"
-            f"Сейчас: <b>{current} мин.</b>\n\n"
-            "Выбери время:",
-            parse_mode="HTML",
-            reply_markup=delay_keyboard(),
-        )
+        AUTOREPLY_MODE = "auto"
 
-        return
-
-    # ========================================================
-    # DELAY
-    # ========================================================
-
-    if action.startswith(
-        "ar_delay_"
-    ):
-
-        try:
-
-            delay = int(
-                action.split("_")[-1]
-            )
-
-        except ValueError:
-
-            delay = 0
-
-        settings = (
-            get_autoreply_settings_runtime()
-        )
-
-        mode = settings.get(
-            "mode",
-            "off",
-        )
-
-        await set_autoreply_settings_runtime(
-            mode,
-            delay,
+        monitor_autoreply(
+            f"Delay changed to "
+            f"{AUTOREPLY_DELAY}m"
         )
 
         await query.edit_message_text(
-            "⏱ <b>ЗАДЕРЖКА ИЗМЕНЕНА</b>\n\n"
-            f"Новое время: <b>{delay} мин.</b>",
+            (
+                "⏱ <b>AUTOREPLY DELAY</b>\n\n"
+                f"Новое время: "
+                f"<b>{AUTOREPLY_DELAY} мин.</b>"
+            ),
             parse_mode="HTML",
             reply_markup=autoreply_keyboard(),
         )
 
         return
 
-    # ========================================================
     # CANCEL
-    # ========================================================
 
     if action == "ar_cancel":
 
-        await cancel_all_autoreplies()
+        STATS["cancelled"] += 1
+
+        monitor_autoreply(
+            "Active autoreplies cancelled"
+        )
 
         await query.edit_message_text(
             "⏹ <b>АКТИВНЫЕ ОТВЕТЫ ОТМЕНЕНЫ</b>",
@@ -1110,434 +1202,121 @@ async def button_handler(
 
         return
 
-    # ========================================================
-    # SECURITY
-    # ========================================================
+    # BACK
 
-    if action == "toggle_security":
-
-        set_security_enabled(
-            not is_security_enabled()
-        )
+    if action == "back":
 
         await query.edit_message_text(
             status_text(),
             parse_mode="HTML",
             reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # MONITORING
-    # ========================================================
-
-    if action == "toggle_monitoring":
-
-        set_monitoring_enabled(
-            not is_monitoring_enabled()
-        )
-
-        await query.edit_message_text(
-            status_text(),
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # NORMAL
-    # ========================================================
-
-    if action == "normal":
-
-        set_normal_mode()
-
-        await query.edit_message_text(
-            status_text(),
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # AGRO
-    # ========================================================
-
-    if action == "agro":
-
-        set_agro_mode(
-            30
-        )
-
-        await query.edit_message_text(
-            status_text(),
-            parse_mode="HTML",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # APPROVE
-    # ========================================================
-
-    if action.startswith(
-        "reply_approve:"
-    ):
-
-        try:
-
-            reply_id = int(
-                action.split(":")[1]
-            )
-
-        except ValueError:
-
-            return
-
-        result = await approve_pending_reply(
-            reply_id
-        )
-
-        if result:
-
-            await query.edit_message_text(
-                "✅ <b>ОТВЕТ ОТПРАВЛЕН</b>\n\n"
-                "JARVIS отправил предложенный ответ.",
-                parse_mode="HTML",
-            )
-
-        else:
-
-            await query.edit_message_text(
-                "❌ Не удалось отправить ответ.\n"
-                "Возможно, он уже обработан.",
-                parse_mode="HTML",
-            )
-
-        return
-
-    # ========================================================
-    # EDIT
-    # ========================================================
-
-    if action.startswith(
-        "reply_edit:"
-    ):
-
-        try:
-
-            reply_id = int(
-                action.split(":")[1]
-            )
-
-        except ValueError:
-
-            return
-
-        pending = await get_pending_reply(
-            reply_id
-        )
-
-        if not pending:
-
-            await query.edit_message_text(
-                "❌ Ответ уже обработан."
-            )
-
-            return
-
-        _editing_reply_id = reply_id
-
-        await query.edit_message_text(
-            "✏️ <b>ИЗМЕНЕНИЕ ОТВЕТА</b>\n\n"
-            "Отправь следующим сообщением "
-            "новый текст ответа.",
-            parse_mode="HTML",
-        )
-
-        return
-
-    # ========================================================
-    # DENY
-    # ========================================================
-
-    if action.startswith(
-        "reply_deny:"
-    ):
-
-        try:
-
-            reply_id = int(
-                action.split(":")[1]
-            )
-
-        except ValueError:
-
-            return
-
-        result = await deny_pending_reply(
-            reply_id
-        )
-
-        if result:
-
-            await query.edit_message_text(
-                "❌ <b>ОТВЕТ ОТКЛОНЁН</b>\n\n"
-                "JARVIS ничего не отправил.",
-                parse_mode="HTML",
-            )
-
-        else:
-
-            await query.edit_message_text(
-                "⚠️ Ответ уже был обработан."
-            )
-
-        return
-
-    # ========================================================
-    # STATISTICS
-    # ========================================================
-
-    if action == "statistics":
-
-        status = get_autoreply_status()
-
-        text = (
-            "📊 <b>STATISTICS</b>\n\n"
-            f"📨 Scheduled: "
-            f"{status.get('total_scheduled', 0)}\n"
-            f"💬 Replies: "
-            f"{status.get('total_replies', 0)}\n"
-            f"⏹ Cancelled: "
-            f"{status.get('total_cancelled', 0)}\n"
-            f"❌ Errors: "
-            f"{status.get('total_errors', 0)}\n"
-            f"⏳ Active: "
-            f"{status.get('pending_chats', 0)}"
-        )
-
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "📈 Analytics",
-                            callback_data="analytics",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ Back",
-                            callback_data="refresh",
-                        ),
-                    ],
-                ]
-            ),
-        )
-
-        return
-
-    # ========================================================
-    # ANALYTICS
-    # ========================================================
-
-    if action == "analytics":
-
-        status = get_autoreply_status()
-
-        scheduled = status.get(
-            "total_scheduled",
-            0,
-        )
-
-        replies = status.get(
-            "total_replies",
-            0,
-        )
-
-        cancelled = status.get(
-            "total_cancelled",
-            0,
-        )
-
-        errors = status.get(
-            "total_errors",
-            0,
-        )
-
-        reply_rate = (
-            (
-                replies
-                / scheduled
-            )
-            * 100
-            if scheduled
-            else 0
-        )
-
-        await query.edit_message_text(
-            (
-                "📈 <b>ANALYTICS</b>\n\n"
-                f"📨 Scheduled: {scheduled}\n"
-                f"💬 Replies: {replies}\n"
-                f"⏹ Cancelled: {cancelled}\n"
-                f"❌ Errors: {errors}\n\n"
-                f"📊 Reply rate: "
-                f"{reply_rate:.1f}%"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "📊 Statistics",
-                            callback_data="statistics",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "⬅️ Back",
-                            callback_data="refresh",
-                        ),
-                    ],
-                ]
-            ),
         )
 
         return
 
 
 # ============================================================
-# EDIT TEXT HANDLER
+# ERROR HANDLER
 # ============================================================
 
-async def edit_text_handler(
-    update: Update,
+async def error_handler(
+    update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    global _editing_reply_id
+    error = context.error
 
-    if not await owner_only(update):
-        return
+    if isinstance(error, Conflict):
 
-    if _editing_reply_id is None:
-        return
+        monitor_error(
+            "TELEGRAM BOT CONFLICT: "
+            "another getUpdates instance "
+            "is using this Bot Token."
+        )
 
-    text = (
-        update.message.text or ""
-    ).strip()
-
-    if not text:
-
-        await update.message.reply_text(
-            "❌ Текст пустой."
+        logger.error(
+            "❌ Another Monitor Bot instance "
+            "is already polling this token."
         )
 
         return
 
-    reply_id = _editing_reply_id
-
-    _editing_reply_id = None
-
-    success = await set_pending_reply_text(
-        reply_id,
-        text,
-    )
-
-    if not success:
-
-        await update.message.reply_text(
-            "❌ Не удалось изменить ответ."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "✏️ <b>ОТВЕТ ИЗМЕНЁН</b>\n\n"
-        f"💬 {text}",
-        parse_mode="HTML",
-        reply_markup=pending_reply_keyboard(
-            reply_id
-        ),
+    monitor_error(
+        f"Telegram error: "
+        f"{type(error).__name__}: {error}"
     )
 
 
 # ============================================================
-# START MONITOR BOT
+# MONITOR LOOP
 # ============================================================
 
-async def start_monitor_bot(
-    owner_id: Optional[int] = None,
-):
+async def monitor_loop():
 
-    global _monitor_application
+    logger.info(
+        "📡 JARVIS monitor loop started."
+    )
+
+    while True:
+
+        try:
+
+            heartbeat()
+
+            if not MONITORING_ENABLED:
+
+                await asyncio.sleep(60)
+
+                continue
+
+            # --------------------------------------------
+            # HEARTBEAT CHECK
+            # --------------------------------------------
+
+            if seconds_since_heartbeat() > 600:
+
+                monitor_error(
+                    "JARVIS heartbeat is stale."
+                )
+
+            await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+
+            logger.info(
+                "📡 Monitor loop stopped."
+            )
+
+            raise
+
+        except Exception as e:
+
+            monitor_error(
+                f"Monitor loop error: {e}"
+            )
+
+            await asyncio.sleep(10)
+
+
+# ============================================================
+# BUILD APPLICATION
+# ============================================================
+
+def build_application():
 
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN не задан."
+            "TELEGRAM_BOT_TOKEN / BOT_TOKEN "
+            "не найден в Environment."
         )
 
-    # ========================================================
-    # LOAD AUTOREPLY SETTINGS
-    # ========================================================
-
-    settings = await get_current_settings()
-
-    print()
-    print(
-        "🤖 Auto Reply settings loaded:"
-    )
-
-    print(
-        f"Mode: "
-        f"{settings.get('mode', 'off')}"
-    )
-
-    print(
-        f"Delay: "
-        f"{settings.get('delay_minutes', 0)} min."
-    )
-
-    # ========================================================
-    # SECURITY STATE
-    # ========================================================
-
-    print(
-        f"🛡 Security: "
-        f"{'ON' if is_security_enabled() else 'OFF'}"
-    )
-
-    # ========================================================
-    # MONITORING STATE
-    # ========================================================
-
-    print(
-        f"📡 Monitoring: "
-        f"{'ON' if is_monitoring_enabled() else 'OFF'}"
-    )
-
-    # ========================================================
-    # APPLICATION
-    # ========================================================
-
     application = (
-        Application.builder()
+        Application
+        .builder()
         .token(BOT_TOKEN)
         .build()
     )
-
-    # ========================================================
-    # COMMANDS
-    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1555,8 +1334,29 @@ async def start_monitor_bot(
 
     application.add_handler(
         CommandHandler(
-            "autoreply",
-            cmd_autoreply,
+            "stats",
+            cmd_stats,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "logs",
+            cmd_logs,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "monitor",
+            cmd_monitor,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "monitor_status",
+            cmd_monitor_status,
         )
     )
 
@@ -1569,136 +1369,255 @@ async def start_monitor_bot(
 
     application.add_handler(
         CommandHandler(
-            "monitoring",
-            cmd_monitoring,
+            "autoreply",
+            cmd_autoreply,
         )
     )
-
-    application.add_handler(
-        CommandHandler(
-            "normal",
-            cmd_normal,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "agro",
-            cmd_agro,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "stats",
-            cmd_stats,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "analytics",
-            cmd_analytics,
-        )
-    )
-
-    # ========================================================
-    # BUTTONS
-    # ========================================================
 
     application.add_handler(
         CallbackQueryHandler(
-            button_handler
+            callback_handler
         )
     )
 
-    # ========================================================
-    # TEXT
-    # ========================================================
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            edit_text_handler,
-        )
-    )
-
-    # ========================================================
-    # START
-    # ========================================================
-
-    await application.initialize()
-
-    await application.start()
-
-    if application.updater:
-
-        await application.updater.start_polling()
-
-    _monitor_application = application
-
-    print()
-    print(
-        "=" * 60
-    )
-    print(
-        "📡 MONITOR BOT ONLINE"
-    )
-    print(
-        "=" * 60
+    application.add_error_handler(
+        error_handler
     )
 
     return application
 
 
 # ============================================================
-# STOP
+# START MONITOR BOT
 # ============================================================
 
-async def stop_monitor_bot():
+async def start_monitor_bot():
 
-    global _monitor_application
+    logger.info(
+        "🤖 Monitor Bot starting..."
+    )
 
-    application = _monitor_application
+    application = build_application()
 
-    if application is None:
+    try:
+
+        await application.initialize()
+
+        await application.start()
+
+        if not application.updater:
+
+            raise RuntimeError(
+                "Telegram updater unavailable."
+            )
+
+        try:
+
+            await application.updater.start_polling(
+                drop_pending_updates=False
+            )
+
+        except Conflict:
+
+            monitor_error(
+                "Monitor Bot getUpdates conflict."
+            )
+
+            try:
+                await application.stop()
+            except Exception:
+                pass
+
+            try:
+                await application.shutdown()
+            except Exception:
+                pass
+
+            return False
+
+        logger.info(
+            "============================================================"
+        )
+
+        logger.info(
+            "📡 MONITOR BOT ONLINE"
+        )
+
+        logger.info(
+            "🤖 Monitor Bot подключён."
+        )
+
+        logger.info(
+            "🛡 Security: %s",
+            (
+                "ON"
+                if get_security_status()
+                else "OFF"
+            ),
+        )
+
+        logger.info(
+            "📡 Monitoring: %s",
+            (
+                "ON"
+                if MONITORING_ENABLED
+                else "OFF"
+            ),
+        )
+
+        logger.info(
+            "============================================================"
+        )
+
+        return application
+
+    except Conflict:
+
+        monitor_error(
+            "Monitor Bot conflict."
+        )
+
+        try:
+            await application.stop()
+        except Exception:
+            pass
+
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
+
+        return False
+
+    except Exception as e:
+
+        monitor_error(
+            f"Monitor Bot startup error: {e}"
+        )
+
+        try:
+            await application.stop()
+        except Exception:
+            pass
+
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
+
+        return False
+
+
+# ============================================================
+# STOP MONITOR BOT
+# ============================================================
+
+async def stop_monitor_bot(
+    application=None,
+):
+
+    logger.info(
+        "🛑 Monitor Bot stopping..."
+    )
+
+    if application:
+
+        try:
+
+            if application.updater:
+
+                await application.updater.stop()
+
+        except Exception:
+            pass
+
+        try:
+
+            await application.stop()
+
+        except Exception:
+            pass
+
+        try:
+
+            await application.shutdown()
+
+        except Exception:
+            pass
+
+    logger.info(
+        "🛑 Monitor Bot stopped."
+    )
+
+
+# ============================================================
+# STANDALONE
+# ============================================================
+
+async def main():
+
+    application = await start_monitor_bot()
+
+    if not application:
+
+        logger.error(
+            "Monitor Bot не запущен."
+        )
+
         return
 
-    try:
-
-        if application.updater:
-
-            await application.updater.stop()
-
-    except Exception as e:
-
-        print(
-            f"⚠️ Updater stop error: {e}"
-        )
-
-    try:
-
-        await application.stop()
-
-    except Exception as e:
-
-        print(
-            f"⚠️ Monitor stop error: {e}"
-        )
-
-    try:
-
-        await application.shutdown()
-
-    except Exception as e:
-
-        print(
-            f"⚠️ Monitor shutdown error: {e}"
-        )
-
-    _monitor_application = None
-
-    print(
-        "📡 MONITOR BOT OFFLINE"
+    monitor_task = asyncio.create_task(
+        monitor_loop()
     )
+
+    try:
+
+        while True:
+
+            await asyncio.sleep(3600)
+
+    except asyncio.CancelledError:
+
+        raise
+
+    finally:
+
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+        await stop_monitor_bot(
+            application
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n🛑 Monitor Bot остановлен."
+        )
+
+    except Exception as e:
+
+        print(
+            "\n🔥 FATAL MONITOR BOT ERROR"
+        )
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
