@@ -1,480 +1,473 @@
 import asyncio
 import os
-import signal
-from datetime import datetime, timezone
+import time
+from contextlib import suppress
 
-from config import (
-    validate_config,
-    OWNER_ID,
-)
+from aiohttp import web
 
-from database import (
-    init_database,
-    close_database,
-)
-
-from monitor_bot import (
-    start_monitor_bot,
-)
-
-from telethon_client import (
-    start_telegram,
-    stop_telegram,
-    set_monitor_bot,
-)
-
-from autoreply import (
-    cancel_all_autoreplies,
-)
-
+from telethon_client import start_telegram, stop_telegram
 
 # ============================================================
-# RENDER HTTP SERVER
+# CONFIG
 # ============================================================
+
+PORT = int(os.getenv("PORT", "10000"))
 
 HOST = "0.0.0.0"
 
-try:
-    PORT = int(os.getenv("PORT", "10000"))
-except (TypeError, ValueError):
-    PORT = 10000
+KEEP_ALIVE_INTERVAL = 180  # 3 минуты
 
-
-http_server = None
-shutdown_event = None
-
-START_TIME = datetime.now(timezone.utc)
+APP_NAME = "JARVIS 2.0"
 
 
 # ============================================================
-# HTTP RESPONSE
+# GLOBAL STATE
 # ============================================================
 
-def http_response(
-    status_code=200,
-    body="OK",
-    content_type="text/plain; charset=utf-8",
-):
-    """
-    Создаёт простой HTTP response для Render.
-    """
+START_TIME = time.time()
 
-    status_texts = {
-        200: "OK",
-        404: "Not Found",
-        405: "Method Not Allowed",
-        500: "Internal Server Error",
-    }
+WEB_APP = None
+WEB_RUNNER = None
+WEB_SITE = None
 
-    status_text = status_texts.get(
-        status_code,
-        "OK",
-    )
-
-    body_bytes = body.encode(
-        "utf-8",
-        errors="replace",
-    )
-
-    headers = (
-        f"HTTP/1.1 {status_code} {status_text}\r\n"
-        f"Content-Type: {content_type}\r\n"
-        f"Content-Length: {len(body_bytes)}\r\n"
-        f"Connection: close\r\n"
-        f"Cache-Control: no-cache, no-store\r\n"
-        f"\r\n"
-    )
-
-    return (
-        headers.encode("utf-8")
-        + body_bytes
-    )
+KEEP_ALIVE_TASK = None
+TELEGRAM_STARTED = False
 
 
 # ============================================================
-# HTTP CLIENT HANDLER
+# LOGGING
 # ============================================================
 
-async def handle_http_client(
-    reader,
-    writer,
-):
+def log(message):
     """
-    Обрабатывает HTTP-запросы Render.
-
-    Поддерживает:
-
-        GET /
-        GET /health
-        GET /status
+    Единый формат логов.
     """
 
-    try:
-
-        # ----------------------------------------------------
-        # READ REQUEST
-        # ----------------------------------------------------
-
-        try:
-
-            data = await asyncio.wait_for(
-                reader.read(8192),
-                timeout=10,
-            )
-
-        except asyncio.TimeoutError:
-
-            writer.write(
-                http_response(
-                    408,
-                    "Request Timeout",
-                )
-            )
-
-            await writer.drain()
-
-            return
-
-        if not data:
-            return
-
-        request = data.decode(
-            "utf-8",
-            errors="ignore",
-        )
-
-        first_line = (
-            request.split(
-                "\r\n",
-                1,
-            )[0]
-            .strip()
-        )
-
-        parts = first_line.split()
-
-        if len(parts) < 2:
-
-            writer.write(
-                http_response(
-                    400,
-                    "Bad Request",
-                )
-            )
-
-            await writer.drain()
-
-            return
-
-        method = parts[0].upper()
-        path = parts[1]
-
-        # ----------------------------------------------------
-        # ONLY GET / HEAD
-        # ----------------------------------------------------
-
-        if method not in {
-            "GET",
-            "HEAD",
-        }:
-
-            response = http_response(
-                405,
-                "Method Not Allowed",
-            )
-
-            writer.write(response)
-
-            await writer.drain()
-
-            return
-
-        # ----------------------------------------------------
-        # ROOT
-        # ----------------------------------------------------
-
-        if path == "/":
-
-            body = (
-                "JARVIS 2.0 ONLINE\n"
-                "Status: OK\n"
-                "Telegram: running\n"
-                "Monitor Bot: running\n"
-            )
-
-            response = http_response(
-                200,
-                body,
-            )
-
-        # ----------------------------------------------------
-        # HEALTH
-        # ----------------------------------------------------
-
-        elif path == "/health":
-
-            body = (
-                "{"
-                "\"status\":\"ok\","
-                "\"service\":\"jarvis-2.0\","
-                "\"telegram\":\"running\","
-                "\"monitor_bot\":\"running\""
-                "}"
-            )
-
-            response = http_response(
-                200,
-                body,
-                "application/json; charset=utf-8",
-            )
-
-        # ----------------------------------------------------
-        # STATUS
-        # ----------------------------------------------------
-
-        elif path == "/status":
-
-            uptime = (
-                datetime.now(timezone.utc)
-                - START_TIME
-            )
-
-            body = (
-                "{"
-                f"\"status\":\"ok\","
-                f"\"service\":\"jarvis-2.0\","
-                f"\"uptime_seconds\":"
-                f"{int(uptime.total_seconds())},"
-                f"\"port\":{PORT}"
-                "}"
-            )
-
-            response = http_response(
-                200,
-                body,
-                "application/json; charset=utf-8",
-            )
-
-        # ----------------------------------------------------
-        # 404
-        # ----------------------------------------------------
-
-        else:
-
-            response = http_response(
-                404,
-                "Not Found",
-            )
-
-        # ----------------------------------------------------
-        # HEAD
-        # ----------------------------------------------------
-
-        if method == "HEAD":
-
-            response_text = response.split(
-                b"\r\n\r\n",
-                1,
-            )[0] + b"\r\n\r\n"
-
-            writer.write(
-                response_text
-            )
-
-        else:
-
-            writer.write(
-                response
-            )
-
-        await writer.drain()
-
-    except (
-        ConnectionResetError,
-        BrokenPipeError,
-        asyncio.IncompleteReadError,
-    ):
-        pass
-
-    except Exception as e:
-
-        print(
-            "⚠️ HTTP handler error: "
-            f"{type(e).__name__}: {e}"
-        )
-
-        try:
-
-            writer.write(
-                http_response(
-                    500,
-                    "Internal Server Error",
-                )
-            )
-
-            await writer.drain()
-
-        except Exception:
-            pass
-
-    finally:
-
-        try:
-
-            writer.close()
-
-            await writer.wait_closed()
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# START HTTP SERVER
-# ============================================================
-
-async def start_http_server():
-    """
-    Запускает HTTP server для Render.
-    """
-
-    global http_server
-
-    print()
     print(
-        "🌐 Starting Render HTTP server..."
+        f"[JARVIS] {message}",
+        flush=True,
     )
 
-    http_server = await asyncio.start_server(
-        handle_http_client,
+
+# ============================================================
+# HTTP ROUTES
+# ============================================================
+
+async def index(request):
+    """
+    Главная страница.
+    """
+
+    uptime = int(
+        time.time() - START_TIME
+    )
+
+    return web.json_response(
+        {
+            "status": "online",
+            "service": APP_NAME,
+            "telegram": TELEGRAM_STARTED,
+            "uptime_seconds": uptime,
+            "timestamp": int(time.time()),
+        }
+    )
+
+
+async def health(request):
+    """
+    Health check для Render.
+    """
+
+    uptime = int(
+        time.time() - START_TIME
+    )
+
+    return web.json_response(
+        {
+            "status": "healthy",
+            "service": APP_NAME,
+            "telegram": TELEGRAM_STARTED,
+            "uptime_seconds": uptime,
+        }
+    )
+
+
+async def ping(request):
+    """
+    Простой ping endpoint.
+    """
+
+    return web.Response(
+        text="JARVIS 2.0 ONLINE",
+        content_type="text/plain",
+    )
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
+
+async def start_web_server():
+    """
+    Запускает HTTP сервер.
+
+    Render требует, чтобы Web Service
+    слушал порт из переменной PORT.
+    """
+
+    global WEB_APP
+    global WEB_RUNNER
+    global WEB_SITE
+
+    log("🌐 Запускаем HTTP server...")
+
+    WEB_APP = web.Application()
+
+    WEB_APP.router.add_get(
+        "/",
+        index,
+    )
+
+    WEB_APP.router.add_get(
+        "/health",
+        health,
+    )
+
+    WEB_APP.router.add_get(
+        "/ping",
+        ping,
+    )
+
+    WEB_RUNNER = web.AppRunner(
+        WEB_APP,
+        access_log=None,
+    )
+
+    await WEB_RUNNER.setup()
+
+    WEB_SITE = web.TCPSite(
+        WEB_RUNNER,
         HOST,
         PORT,
-        reuse_address=True,
     )
 
-    addresses = []
+    await WEB_SITE.start()
 
-    for sock in http_server.sockets or []:
+    log(
+        f"🌐 HTTP server: ONLINE "
+        f"http://{HOST}:{PORT}"
+    )
+
+    log(
+        f"❤️ Health: /health"
+    )
+
+    log(
+        f"🏠 Home: /"
+    )
+
+
+async def stop_web_server():
+    """
+    Останавливает HTTP сервер.
+    """
+
+    global WEB_APP
+    global WEB_RUNNER
+    global WEB_SITE
+
+    log("🌐 Останавливаем HTTP server...")
+
+    if WEB_SITE is not None:
+
+        with suppress(Exception):
+            await WEB_SITE.stop()
+
+        WEB_SITE = None
+
+    if WEB_RUNNER is not None:
+
+        with suppress(Exception):
+            await WEB_RUNNER.cleanup()
+
+        WEB_RUNNER = None
+
+    WEB_APP = None
+
+    log("🌐 HTTP server: OFFLINE")
+
+
+# ============================================================
+# KEEP ALIVE
+# ============================================================
+
+async def keep_alive_loop():
+    """
+    Внутренний heartbeat.
+
+    Каждые 3 минуты выводит heartbeat в Render Logs.
+
+    ВАЖНО:
+    Этот цикл поддерживает активность самого процесса.
+    Для Render Web Service также обязательно наличие
+    HTTP-сервера на PORT.
+    """
+
+    log(
+        "💓 Keep-alive loop запущен "
+        f"(каждые {KEEP_ALIVE_INTERVAL} сек.)"
+    )
+
+    while True:
 
         try:
 
-            addresses.append(
-                str(sock.getsockname())
+            await asyncio.sleep(
+                KEEP_ALIVE_INTERVAL
             )
 
-        except Exception:
-            pass
+            uptime = int(
+                time.time() - START_TIME
+            )
 
-    print(
-        f"🌐 HTTP server: ONLINE"
-    )
+            log(
+                f"💓 JARVIS heartbeat | "
+                f"uptime={uptime}s | "
+                f"telegram={TELEGRAM_STARTED}"
+            )
 
-    print(
-        f"🌐 Host: {HOST}"
-    )
+        except asyncio.CancelledError:
 
-    print(
-        f"🌐 Port: {PORT}"
-    )
+            log(
+                "💓 Keep-alive loop остановлен."
+            )
 
-    print(
-        f"🌐 Addresses: "
-        f"{', '.join(addresses)}"
-    )
+            raise
 
-    print(
-        "🌐 Health endpoint: /health"
-    )
+        except Exception as e:
 
-    return http_server
+            log(
+                "⚠️ Keep-alive error: "
+                f"{type(e).__name__}: {e}"
+            )
 
 
 # ============================================================
-# STOP HTTP SERVER
+# STARTUP
 # ============================================================
 
-async def stop_http_server():
+async def startup():
     """
-    Корректно останавливает HTTP server.
+    Полный запуск JARVIS.
     """
 
-    global http_server
+    global KEEP_ALIVE_TASK
+    global TELEGRAM_STARTED
 
-    if http_server is None:
-        return
+    print()
+    print("=" * 70)
+    print("🤖 JARVIS 2.0")
+    print("=" * 70)
+    print()
 
-    print(
-        "🌐 Stopping HTTP server..."
+    log("🚀 Запуск JARVIS...")
+
+    # --------------------------------------------------------
+    # ENV CHECK
+    # --------------------------------------------------------
+
+    log("🔧 Проверяем Environment Variables...")
+
+    required_variables = [
+        "TG_API_ID",
+        "TG_API_HASH",
+        "TG_SESSION",
+    ]
+
+    missing = []
+
+    for variable in required_variables:
+
+        value = os.getenv(variable)
+
+        if not value:
+
+            missing.append(variable)
+
+    if missing:
+
+        log(
+            "⚠️ Не найдены ENV переменные: "
+            + ", ".join(missing)
+        )
+
+        log(
+            "⚠️ Telegram может не запуститься."
+        )
+
+    else:
+
+        log(
+            "✅ Telegram ENV variables: OK"
+        )
+
+    # --------------------------------------------------------
+    # WEB SERVER FIRST
+    # --------------------------------------------------------
+
+    # Очень важно для Render:
+    # сначала поднимаем HTTP server.
+    await start_web_server()
+
+    # --------------------------------------------------------
+    # KEEP ALIVE
+    # --------------------------------------------------------
+
+    KEEP_ALIVE_TASK = asyncio.create_task(
+        keep_alive_loop()
+    )
+
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    log(
+        "📱 Запускаем Telegram Client..."
     )
 
     try:
 
-        http_server.close()
+        await start_telegram()
 
-        await http_server.wait_closed()
+        TELEGRAM_STARTED = True
+
+        log(
+            "✅ Telegram Client: ONLINE"
+        )
 
     except Exception as e:
 
-        print(
-            "⚠️ HTTP shutdown error: "
+        TELEGRAM_STARTED = False
+
+        log(
+            "❌ Telegram startup error: "
             f"{type(e).__name__}: {e}"
         )
 
-    finally:
+        # ----------------------------------------------------
+        # ВАЖНО
+        # ----------------------------------------------------
+        #
+        # Не завершаем HTTP server.
+        #
+        # Благодаря этому Render получает ответ,
+        # а ошибка Telegram видна в Logs.
+        #
 
-        http_server = None
-
-    print(
-        "🌐 HTTP server: OFFLINE"
-    )
-
-
-# ============================================================
-# SIGNAL HANDLER
-# ============================================================
-
-def install_signal_handlers(
-    loop,
-    shutdown,
-):
-    """
-    Обрабатывает SIGTERM/SIGINT.
-
-    Render отправляет SIGTERM перед остановкой
-    сервиса.
-    """
-
-    def request_shutdown():
-
-        print()
-        print(
-            "🛑 Shutdown signal received."
+        log(
+            "⚠️ HTTP server продолжает работать."
         )
 
-        if not shutdown.is_set():
+    # --------------------------------------------------------
+    # READY
+    # --------------------------------------------------------
 
-            shutdown.set()
+    print()
+    print("=" * 70)
+    print("✅ JARVIS 2.0 READY")
+    print("=" * 70)
+    print()
 
-    for sig in (
-        signal.SIGINT,
-        signal.SIGTERM,
-    ):
+    log(
+        f"🌐 PORT = {PORT}"
+    )
+
+    log(
+        "❤️ Health endpoint = /health"
+    )
+
+    log(
+        f"💓 Heartbeat = every "
+        f"{KEEP_ALIVE_INTERVAL} seconds"
+    )
+
+    log(
+        f"📱 Telegram = "
+        f"{'ONLINE' if TELEGRAM_STARTED else 'OFFLINE'}"
+    )
+
+    print()
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+async def shutdown():
+    """
+    Корректно останавливает JARVIS.
+    """
+
+    global KEEP_ALIVE_TASK
+    global TELEGRAM_STARTED
+
+    print()
+    print("=" * 70)
+    print("🛑 JARVIS SHUTDOWN")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # KEEP ALIVE
+    # --------------------------------------------------------
+
+    if KEEP_ALIVE_TASK is not None:
+
+        log(
+            "💓 Останавливаем keep-alive..."
+        )
+
+        KEEP_ALIVE_TASK.cancel()
+
+        with suppress(
+            asyncio.CancelledError
+        ):
+
+            await KEEP_ALIVE_TASK
+
+        KEEP_ALIVE_TASK = None
+
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    if TELEGRAM_STARTED:
+
+        log(
+            "📱 Останавливаем Telegram..."
+        )
 
         try:
 
-            loop.add_signal_handler(
-                sig,
-                request_shutdown,
+            await stop_telegram()
+
+        except Exception as e:
+
+            log(
+                "⚠️ Telegram shutdown error: "
+                f"{type(e).__name__}: {e}"
             )
 
-        except (
-            NotImplementedError,
-            RuntimeError,
-        ):
+        TELEGRAM_STARTED = False
 
-            # Например, если окружение не позволяет
-            # устанавливать signal handler.
-            pass
+    # --------------------------------------------------------
+    # WEB
+    # --------------------------------------------------------
+
+    await stop_web_server()
+
+    log(
+        "✅ JARVIS полностью остановлен."
+    )
 
 
 # ============================================================
@@ -482,450 +475,39 @@ def install_signal_handlers(
 # ============================================================
 
 async def main():
+    """
+    Главная функция.
+    """
 
-    global shutdown_event
-
-    print()
-    print("=" * 60)
-    print("🤖 JARVIS 2.0 STARTING")
-    print("=" * 60)
-    print()
-
-    # --------------------------------------------------------
-    # SHUTDOWN EVENT
-    # --------------------------------------------------------
-
-    shutdown_event = asyncio.Event()
-
-    loop = asyncio.get_running_loop()
-
-    install_signal_handlers(
-        loop,
-        shutdown_event,
-    )
-
-    monitor_application = None
-
-    # --------------------------------------------------------
-    # CONFIG
-    # --------------------------------------------------------
+    await startup()
 
     try:
 
-        print(
-            "⚙️ Validating configuration..."
-        )
+        # ----------------------------------------------------
+        # НЕ ДАЁМ ПРОЦЕССУ ЗАВЕРШИТЬСЯ
+        # ----------------------------------------------------
 
-        validate_config()
+        while True:
 
-        print(
-            "✅ Configuration: OK"
-        )
-
-    except Exception as e:
-
-        print()
-        print(
-            "❌ Configuration error:"
-        )
-
-        print(
-            f"{type(e).__name__}: {e}"
-        )
-
-        raise
-
-    # --------------------------------------------------------
-    # DATABASE
-    # --------------------------------------------------------
-
-    try:
-
-        print(
-            "💾 Starting database..."
-        )
-
-        await init_database()
-
-        print(
-            "💾 Database: ONLINE"
-        )
-
-    except Exception as e:
-
-        print()
-        print(
-            "❌ Database startup error:"
-        )
-
-        print(
-            f"{type(e).__name__}: {e}"
-        )
-
-        raise
-
-    try:
-
-        # ====================================================
-        # HTTP SERVER
-        # ====================================================
-
-        try:
-
-            await start_http_server()
-
-        except Exception as e:
-
-            print()
-            print(
-                "❌ HTTP server startup failed:"
+            await asyncio.sleep(
+                3600
             )
-
-            print(
-                f"{type(e).__name__}: {e}"
-            )
-
-            raise
-
-        # ====================================================
-        # TELEGRAM
-        # ====================================================
-
-        print()
-
-        print(
-            "📱 Starting Telegram..."
-        )
-
-        me = await start_telegram()
-
-        if me is None:
-
-            raise RuntimeError(
-                "Telegram account is unavailable."
-            )
-
-        print(
-            "✅ Telegram Client: ONLINE"
-        )
-
-        # ====================================================
-        # MONITOR BOT
-        # ====================================================
-
-        print()
-
-        print(
-            "🤖 Starting Monitor Bot..."
-        )
-
-        monitor_application = (
-            await start_monitor_bot(
-                owner_id=OWNER_ID
-            )
-        )
-
-        if monitor_application is None:
-
-            raise RuntimeError(
-                "Monitor Bot application "
-                "was not created."
-            )
-
-        set_monitor_bot(
-            monitor_application.bot
-        )
-
-        print(
-            "✅ Monitor Bot: ONLINE"
-        )
-
-        # ====================================================
-        # ONLINE
-        # ====================================================
-
-        print()
-        print("=" * 60)
-        print("🟢 JARVIS 2.0 ONLINE")
-        print("=" * 60)
-        print()
-
-        print(
-            f"👤 Account: "
-            f"{getattr(me, 'first_name', 'Unknown')}"
-        )
-
-        print(
-            f"🆔 ID: "
-            f"{getattr(me, 'id', 'Unknown')}"
-        )
-
-        username = getattr(
-            me,
-            "username",
-            None,
-        )
-
-        if username:
-
-            print(
-                f"📛 Username: @{username}"
-            )
-
-        print()
-
-        print(
-            "🧠 AI: ONLINE"
-        )
-
-        print(
-            "🛡️ Anti-Spam: 24/7"
-        )
-
-        print(
-            "🎣 Anti-Scam: 24/7"
-        )
-
-        print(
-            "🗑️ Deleted messages: ON"
-        )
-
-        print(
-            "✏️ Edited messages: ON"
-        )
-
-        print(
-            "📨 Auto Reply: 30 minutes"
-        )
-
-        print(
-            "🔥 Agro Mode: maximum 30 minutes"
-        )
-
-        print()
-
-        print(
-            f"🌐 Render Port: {PORT}"
-        )
-
-        print(
-            "🌐 Health: /health"
-        )
-
-        print()
-
-        print(
-            "🚀 JARVIS is ready."
-        )
-
-        print(
-            "Press Ctrl+C to stop."
-        )
-
-        print()
-
-        # ====================================================
-        # WAIT
-        # ====================================================
-
-        await shutdown_event.wait()
 
     except asyncio.CancelledError:
 
-        print(
-            "🛑 Main task cancelled."
-        )
-
-        raise
-
-    except KeyboardInterrupt:
-
-        print(
-            "🛑 Keyboard interrupt."
-        )
-
-    except Exception as e:
-
-        print()
-        print(
-            "🔥 JARVIS MAIN ERROR"
-        )
-
-        print(
-            f"{type(e).__name__}: {e}"
+        log(
+            "⚠️ Main task cancelled."
         )
 
         raise
 
     finally:
 
-        print()
-        print("=" * 60)
-        print("🛑 STOPPING JARVIS")
-        print("=" * 60)
-        print()
-
-        # ====================================================
-        # AUTOREPLY
-        # ====================================================
-
-        try:
-
-            print(
-                "🤖 Stopping AutoReply..."
-            )
-
-            await cancel_all_autoreplies()
-
-            print(
-                "🤖 AutoReply: OFFLINE"
-            )
-
-        except Exception as e:
-
-            print(
-                "⚠️ AutoReply shutdown error: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        # ====================================================
-        # MONITOR BOT
-        # ====================================================
-
-        if monitor_application:
-
-            try:
-
-                print(
-                    "🤖 Stopping Monitor Bot..."
-                )
-
-                updater = getattr(
-                    monitor_application,
-                    "updater",
-                    None,
-                )
-
-                if updater:
-
-                    try:
-
-                        if updater.running:
-
-                            await updater.stop()
-
-                    except Exception as e:
-
-                        print(
-                            "⚠️ Monitor updater stop error: "
-                            f"{type(e).__name__}: {e}"
-                        )
-
-                try:
-
-                    if monitor_application.running:
-
-                        await monitor_application.stop()
-
-                except Exception as e:
-
-                    print(
-                        "⚠️ Monitor application stop error: "
-                        f"{type(e).__name__}: {e}"
-                    )
-
-                try:
-
-                    await monitor_application.shutdown()
-
-                except Exception as e:
-
-                    print(
-                        "⚠️ Monitor application shutdown error: "
-                        f"{type(e).__name__}: {e}"
-                    )
-
-                print(
-                    "🤖 Monitor Bot: OFFLINE"
-                )
-
-            except Exception as e:
-
-                print(
-                    "⚠️ Monitor shutdown error: "
-                    f"{type(e).__name__}: {e}"
-                )
-
-        # ====================================================
-        # TELEGRAM
-        # ====================================================
-
-        try:
-
-            print(
-                "📱 Stopping Telegram..."
-            )
-
-            await stop_telegram()
-
-            print(
-                "📱 Telegram: OFFLINE"
-            )
-
-        except Exception as e:
-
-            print(
-                "⚠️ Telegram shutdown error: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        # ====================================================
-        # HTTP
-        # ====================================================
-
-        try:
-
-            await stop_http_server()
-
-        except Exception as e:
-
-            print(
-                "⚠️ HTTP shutdown error: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        # ====================================================
-        # DATABASE
-        # ====================================================
-
-        try:
-
-            print(
-                "💾 Closing database..."
-            )
-
-            await close_database()
-
-            print(
-                "💾 Database: OFFLINE"
-            )
-
-        except Exception as e:
-
-            print(
-                "⚠️ Database shutdown error: "
-                f"{type(e).__name__}: {e}"
-            )
-
-        print()
-        print("=" * 60)
-        print("🔴 JARVIS 2.0 OFFLINE")
-        print("=" * 60)
-        print()
+        await shutdown()
 
 
 # ============================================================
-# RUN
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
@@ -938,19 +520,26 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
+        print()
         print(
-            "🛑 JARVIS stopped."
+            "🛑 JARVIS остановлен вручную."
         )
 
     except Exception as e:
 
         print()
         print(
-            "❌ Fatal error:"
+            "=" * 70
+        )
+
+        print(
+            "🔥 FATAL JARVIS ERROR"
         )
 
         print(
             f"{type(e).__name__}: {e}"
         )
 
-        raise
+        print(
+            "=" * 70
+        )
