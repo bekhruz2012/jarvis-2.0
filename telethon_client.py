@@ -29,6 +29,7 @@ from config import (
 )
 
 from database import (
+    init_database,
     save_user,
     save_message,
     get_message,
