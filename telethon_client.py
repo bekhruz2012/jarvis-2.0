@@ -6,6 +6,7 @@ from collections import defaultdict, deque
 from html import escape
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.functions.contacts import (
     BlockRequest,
@@ -51,15 +52,35 @@ from autoreply import (
 
 
 # ============================================================
-# TELEGRAM CLIENT
+# TELEGRAM SESSION
 # ============================================================
 
-client = TelegramClient(
-    SESSION_NAME,
-    TG_API_ID,
-    TG_API_HASH,
-)
+# На Render используется TG_SESSION.
+# Локально можно оставить SESSION_NAME для первоначальной
+# авторизации и генерации StringSession.
 
+import os
+
+TG_SESSION = os.getenv("TG_SESSION", "").strip()
+
+if TG_SESSION:
+    print("🔐 Telegram: используем StringSession из ENV")
+
+    client = TelegramClient(
+        StringSession(TG_SESSION),
+        TG_API_ID,
+        TG_API_HASH,
+    )
+
+else:
+    print("🔐 Telegram: StringSession не найдена")
+    print("📱 Используется локальная SESSION_NAME")
+
+    client = TelegramClient(
+        SESSION_NAME,
+        TG_API_ID,
+        TG_API_HASH,
+    )
 
 # ============================================================
 # GLOBAL STATE
