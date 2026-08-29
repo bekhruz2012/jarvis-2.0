@@ -96,10 +96,6 @@ def rows_to_dicts(rows):
 async def init_database():
     print("💾 Инициализация Database...")
 
-    await init_database()
-
-    print("💾 Database tables: READY")
-    
     def _init():
 
         conn = _connect()
@@ -406,6 +402,7 @@ async def init_database():
 
     await asyncio.to_thread(_init)
 
+    print("💾 Database tables: READY")
     print("💾 Database: ONLINE")
 
 
