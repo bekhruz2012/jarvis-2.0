@@ -34,7 +34,6 @@ from database import (
     get_chat_messages,
     block_user,
     unblock_user,
-    increment_stat,
 )
 
 from security import analyze_message
@@ -183,7 +182,7 @@ def raw_text(text, limit=10000):
     try:
         text = str(text)
     except Exception:
-        return ""
+        text = ""
 
     if len(text) > limit:
         text = text[:limit] + "\n…"
@@ -192,7 +191,7 @@ def raw_text(text, limit=10000):
 
 
 # ============================================================
-# BOT
+# MONITOR BOT
 # ============================================================
 
 def set_monitor_bot(bot):
@@ -673,6 +672,8 @@ def history_keyboard(user_id):
     Inline keyboard для Security notification.
     """
 
+    user_id = safe_int(user_id)
+
     return InlineKeyboardMarkup(
         [
             [
@@ -694,6 +695,10 @@ def history_keyboard(user_id):
         ]
     )
 
+
+# ============================================================
+# SECURITY BLOCK NOTIFICATION
+# ============================================================
 
 async def notify_security_block(
     sender,
@@ -764,8 +769,7 @@ async def notify_security_warning(
     text,
 ):
     """
-    Уведомление о подозрительном сообщении,
-    которое пока не привело к блокировке.
+    Уведомление о подозрительном сообщении.
     """
 
     if sender is None:
@@ -974,9 +978,8 @@ async def process_security(
     """
     Полностью обрабатывает Security.
 
-    Возвращает:
-        True  -> обработка завершена, дальше не надо
-        False -> можно продолжать AutoReply
+    True  -> обработка завершена.
+    False -> можно продолжать AutoReply.
     """
 
     if sender is None:
@@ -1007,7 +1010,6 @@ async def process_security(
             f"{type(e).__name__}: {e}"
         )
 
-        # Security никогда не должен ломать AutoReply.
         return False
 
     spam_score = result.get(
@@ -1094,8 +1096,6 @@ async def process_security(
 
             return True
 
-        # Если Telegram block не удался,
-        # не прекращаем работу AutoReply.
         print(
             "⚠️ Telegram block failed; "
             "continuing message processing."
@@ -1158,7 +1158,6 @@ async def new_message(event):
 
             MY_ID = me.id
 
-        # Не обрабатываем собственные сообщения.
         if event.sender_id == MY_ID:
             return
 
@@ -1337,9 +1336,11 @@ async def new_message(event):
         )
 
         if stop_processing:
+
             print(
                 "🚫 Message processing stopped by Security."
             )
+
             return
 
         # ----------------------------------------------------
@@ -1349,6 +1350,7 @@ async def new_message(event):
         if event.is_private:
 
             try:
+
                 await register_incoming(
                     chat_id=chat_id,
                     sender_id=sender_id,
@@ -1373,6 +1375,7 @@ async def new_message(event):
         print(
             "🔥 NEW MESSAGE HANDLER ERROR"
         )
+
         print(
             f"{type(e).__name__}: {e}"
         )
@@ -1856,10 +1859,6 @@ async def flush_deleted_batch(chat_id):
         if not messages:
             return
 
-        # ----------------------------------------------------
-        # SORT
-        # ----------------------------------------------------
-
         messages.sort(
             key=lambda item: (
                 item.get(
@@ -2054,19 +2053,11 @@ async def deleted_message(event):
 
                 continue
 
-            # ------------------------------------------------
-            # ADD TO BATCH
-            # ------------------------------------------------
-
             _deleted_batches[
                 actual_chat_id
             ].append(
                 deleted
             )
-
-            # ------------------------------------------------
-            # ONE TIMER PER CHAT
-            # ------------------------------------------------
 
             existing_task = (
                 _deleted_batch_tasks.get(
@@ -2252,7 +2243,6 @@ async def block_telegram_user(user_id):
     if not user_id:
         return False
 
-    # Никогда не блокируем владельца.
     if (
         MY_ID is not None
         and user_id == MY_ID
@@ -2463,6 +2453,411 @@ async def get_private_user(user_id):
 
 
 # ============================================================
+# CALLBACK BUTTONS
+# ============================================================
+
+async def answer_callback(
+    query,
+    text,
+    alert=False,
+):
+    """
+    Безопасно отвечает на callback query.
+    """
+
+    try:
+
+        await query.answer(
+            text,
+            alert=alert,
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Callback answer error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+async def edit_callback_message(
+    query,
+    text,
+    buttons=None,
+):
+    """
+    Безопасно редактирует сообщение Monitor Bot.
+    """
+
+    try:
+
+        await query.edit_message_text(
+            text=text,
+            parse_mode="HTML",
+            reply_markup=buttons,
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "⚠️ Callback edit error: "
+            f"{type(e).__name__}: {e}"
+        )
+
+        return False
+
+
+@client.on(
+    events.CallbackQuery()
+)
+async def monitor_callback(event):
+    """
+    Обрабатывает кнопки Monitor Bot.
+
+    Поддерживает:
+
+        history:<user_id>
+        block:<user_id>
+    """
+
+    try:
+
+        data = event.data
+
+        if not data:
+            return
+
+        if isinstance(data, bytes):
+
+            data = data.decode(
+                "utf-8",
+                errors="ignore",
+            )
+
+        data = str(data)
+
+        # ----------------------------------------------------
+        # SECURITY
+        # ----------------------------------------------------
+
+        if MY_ID is None:
+
+            await answer_callback(
+                event,
+                "❌ JARVIS ещё не определил владельца.",
+                alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # ONLY OWNER
+        # ----------------------------------------------------
+
+        callback_sender_id = safe_int(
+            getattr(
+                event,
+                "sender_id",
+                None,
+            )
+        )
+
+        if (
+            callback_sender_id is not None
+            and callback_sender_id != MY_ID
+        ):
+
+            await answer_callback(
+                event,
+                "🚫 Доступ запрещён.",
+                alert=True,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # HISTORY
+        # ----------------------------------------------------
+
+        if data.startswith(
+            "history:"
+        ):
+
+            raw_user_id = data.split(
+                ":",
+                1,
+            )[1]
+
+            user_id = safe_int(
+                raw_user_id
+            )
+
+            if not user_id:
+
+                await answer_callback(
+                    event,
+                    "❌ Некорректный User ID.",
+                    alert=True,
+                )
+
+                return
+
+            await answer_callback(
+                event,
+                "📖 Загружаю историю...",
+            )
+
+            history = await show_chat_history(
+                user_id,
+                limit=30,
+            )
+
+            await edit_callback_message(
+                event,
+                history,
+                InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "🚫 Заблокировать",
+                                callback_data=(
+                                    f"block:{user_id}"
+                                ),
+                            )
+                        ]
+                    ]
+                ),
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # BLOCK
+        # ----------------------------------------------------
+
+        if data.startswith(
+            "block:"
+        ):
+
+            raw_user_id = data.split(
+                ":",
+                1,
+            )[1]
+
+            user_id = safe_int(
+                raw_user_id
+            )
+
+            if not user_id:
+
+                await answer_callback(
+                    event,
+                    "❌ Некорректный User ID.",
+                    alert=True,
+                )
+
+                return
+
+            if (
+                MY_ID is not None
+                and user_id == MY_ID
+            ):
+
+                await answer_callback(
+                    event,
+                    "🛑 Нельзя заблокировать владельца.",
+                    alert=True,
+                )
+
+                return
+
+            await answer_callback(
+                event,
+                "🚫 Блокирую пользователя...",
+            )
+
+            success = await manual_block_user(
+                user_id=user_id,
+                reason="Заблокировано владельцем через Monitor Bot",
+            )
+
+            if success:
+
+                await edit_callback_message(
+                    event,
+                    (
+                        "🚫 <b>Пользователь заблокирован</b>\n\n"
+                        f"🆔 User ID: "
+                        f"<code>{user_id}</code>\n\n"
+                        "🛡️ Telegram: заблокирован\n"
+                        "💾 Database: сохранено"
+                    ),
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🔓 Разблокировать",
+                                    callback_data=(
+                                        f"unblock:{user_id}"
+                                    ),
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "📖 История",
+                                    callback_data=(
+                                        f"history:{user_id}"
+                                    ),
+                                )
+                            ],
+                        ]
+                    ),
+                )
+
+            else:
+
+                await edit_callback_message(
+                    event,
+                    (
+                        "❌ <b>Не удалось заблокировать</b>\n\n"
+                        f"🆔 User ID: "
+                        f"<code>{user_id}</code>\n\n"
+                        "Telegram block завершился ошибкой."
+                    ),
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "🔄 Попробовать снова",
+                                    callback_data=(
+                                        f"block:{user_id}"
+                                    ),
+                                )
+                            ]
+                        ]
+                    ),
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # UNBLOCK
+        # ----------------------------------------------------
+
+        if data.startswith(
+            "unblock:"
+        ):
+
+            raw_user_id = data.split(
+                ":",
+                1,
+            )[1]
+
+            user_id = safe_int(
+                raw_user_id
+            )
+
+            if not user_id:
+
+                await answer_callback(
+                    event,
+                    "❌ Некорректный User ID.",
+                    alert=True,
+                )
+
+                return
+
+            await answer_callback(
+                event,
+                "🔓 Разблокирую...",
+            )
+
+            success = await manual_unblock_user(
+                user_id
+            )
+
+            if success:
+
+                await edit_callback_message(
+                    event,
+                    (
+                        "🔓 <b>Пользователь разблокирован</b>\n\n"
+                        f"🆔 User ID: "
+                        f"<code>{user_id}</code>\n\n"
+                        "🛡️ Telegram: разблокирован\n"
+                        "💾 Database: обновлено"
+                    ),
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "📖 История",
+                                    callback_data=(
+                                        f"history:{user_id}"
+                                    ),
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "🚫 Заблокировать",
+                                    callback_data=(
+                                        f"block:{user_id}"
+                                    ),
+                                )
+                            ],
+                        ]
+                    ),
+                )
+
+            else:
+
+                await edit_callback_message(
+                    event,
+                    (
+                        "❌ <b>Не удалось разблокировать</b>\n\n"
+                        f"🆔 User ID: "
+                        f"<code>{user_id}</code>"
+                    ),
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # UNKNOWN CALLBACK
+        # ----------------------------------------------------
+
+        await answer_callback(
+            event,
+            "⚠️ Неизвестная команда.",
+            alert=True,
+        )
+
+    except Exception as e:
+
+        print()
+        print(
+            "🔥 CALLBACK HANDLER ERROR"
+        )
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+        try:
+
+            await answer_callback(
+                event,
+                "❌ Произошла ошибка.",
+                alert=True,
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
 # START TELEGRAM
 # ============================================================
 
@@ -2567,10 +2962,6 @@ async def stop_telegram():
         "📱 Останавливаем Telegram..."
     )
 
-    # --------------------------------------------------------
-    # CANCEL DELETE TASKS
-    # --------------------------------------------------------
-
     tasks = list(
         _deleted_batch_tasks.values()
     )
@@ -2588,10 +2979,6 @@ async def stop_telegram():
             pass
 
     _deleted_batches.clear()
-
-    # --------------------------------------------------------
-    # DISCONNECT
-    # --------------------------------------------------------
 
     try:
 
