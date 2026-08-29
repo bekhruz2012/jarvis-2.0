@@ -2618,57 +2618,68 @@ async def stop_health_server():
 # START TELEGRAM
 # ============================================================
 
+
 async def start_telegram():
 
     global MY_ID
     global MY_USERNAME
     global MY_NAME
 
-    print(
-        "📱 Запускаем Telegram Client..."
-    )
+    print("📱 Запускаем Telegram Client...")
 
     # ========================================================
-    # STRING SESSION
+    # TELEGRAM AUTH
     # ========================================================
 
-    if TG_SESSION:
+    try:
 
+        if TG_SESSION:
+
+            print("🔐 Используем TG_SESSION из ENV")
+
+            # ВАЖНО:
+            # На Render нельзя использовать client.start(),
+            # потому что он может попытаться запросить код
+            # через input().
+
+            await client.connect()
+
+            authorized = await client.is_user_authorized()
+
+            if not authorized:
+
+                raise RuntimeError(
+                    "TG_SESSION существует, "
+                    "но Telegram session не авторизована."
+                )
+
+        else:
+
+            print("🔐 TG_SESSION не найдена.")
+            print("📱 Используется локальная SESSION_NAME.")
+
+            # Локально разрешаем интерактивную авторизацию.
+            await client.start()
+
+    except Exception as e:
+
+        print()
+        print("❌ TELEGRAM AUTH ERROR")
         print(
-            "🔐 Проверяем TG_SESSION..."
+            f"{type(e).__name__}: {e}"
         )
 
-        # ВАЖНО:
-        # НЕ используем client.start()
-        # потому что start() может вызвать input()
-        # на Render.
+        raise
 
-        await client.connect()
+    # ========================================================
+    # CHECK CONNECTION
+    # ========================================================
 
-        if not await client.is_user_authorized():
+    if not client.is_connected():
 
-            raise RuntimeError(
-                "TG_SESSION существует, "
-                "но Telegram session не авторизована. "
-                "Сгенерируй новую StringSession "
-                "локально и обнови TG_SESSION на Render."
-            )
-
-    else:
-
-        # ====================================================
-        # LOCAL MODE
-        # ====================================================
-
-        print(
-            "📱 TG_SESSION отсутствует."
+        raise RuntimeError(
+            "Telegram Client не подключён."
         )
-
-        print(
-            "📱 Используем локальную авторизацию."
-        )
-
-        await client.start()
 
     # ========================================================
     # GET ACCOUNT
@@ -2679,7 +2690,8 @@ async def start_telegram():
     if me is None:
 
         raise RuntimeError(
-            "Не удалось получить Telegram аккаунт."
+            "Telegram API не вернул информацию "
+            "о текущем аккаунте."
         )
 
     MY_ID = me.id
@@ -2696,25 +2708,39 @@ async def start_telegram():
         None,
     )
 
+    # ========================================================
+    # DATABASE
+    # ========================================================
+
     await init_edit_history()
+    
+    from autoreply import set_autoreply_settings_runtime
+
+    await set_autoreply_settings_runtime(
+        mode="auto",
+        delay_minutes=0,
+    )
 
     # ========================================================
-    # RENDER HEALTH
+    # EVENT HANDLERS
     # ========================================================
 
-    await start_health_server()
+    # Handler @client.on(events.NewMessage(...))
+    # уже зарегистрирован выше в этом файле.
+    #
+    # Ничего дополнительно запускать здесь НЕ нужно.
 
     # ========================================================
     # LOG
     # ========================================================
 
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("✅ TELEGRAM CLIENT ONLINE")
-    print("=" * 60)
+    print("=" * 70)
 
     print(
-        f"👤 Account: {MY_NAME}"
+        f"👤 Account: {MY_NAME or 'Unknown'}"
     )
 
     if MY_USERNAME:
@@ -2727,43 +2753,19 @@ async def start_telegram():
         f"🆔 ID: {MY_ID}"
     )
 
-    print(
-        "🛡️ Security: 24/7"
-    )
-
-    print(
-        "👁️ Monitoring: ALL CHATS"
-    )
-
-    print(
-        "💬 Private chats: monitored"
-    )
-
-    print(
-        "👥 Groups: monitored"
-    )
-
-    print(
-        "👥 Supergroups: monitored"
-    )
-
-    print(
-        "📢 Channels: monitored where Telegram provides events"
-    )
-
-    print(
-        f"🎛️ Mode: {get_mode()}"
-    )
-
-    print(
-        f"🌐 Health port: {RENDER_PORT}"
-    )
-
-    print(
-        "=" * 60
-    )
+    print()
+    print("📡 Telegram event listener: ONLINE")
+    print("📩 Incoming messages: ENABLED")
+    print("📤 Outgoing messages: ENABLED")
+    print("✏️ Edited messages: ENABLED")
+    print("🗑️ Deleted messages: ENABLED")
+    print("🛡️ Security: ENABLED")
+    print("🤖 AutoReply: ENABLED")
+    print()
+    print("=" * 70)
 
     return me
+
 
 
 # ============================================================
